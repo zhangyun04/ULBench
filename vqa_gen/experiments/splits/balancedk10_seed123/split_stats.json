@@ -1,0 +1,105 @@
+{
+  "mode": "superclass_balanced_k",
+  "seed": 123,
+  "k": 10,
+  "selected_forget_classes": [
+    "bed",
+    "bus",
+    "clock",
+    "person",
+    "pizza",
+    "sink",
+    "stop sign",
+    "teddy bear",
+    "train",
+    "zebra"
+  ],
+  "input_total": 8521,
+  "forget_pool_size": 2989,
+  "retain_pool_size": 5532,
+  "counts": {
+    "train_forget": 500,
+    "train_retain": 1000,
+    "test_forget": 500,
+    "test_retain": 500
+  },
+  "per_forget_class_counts": {
+    "train_forget": {
+      "bed": 50,
+      "bus": 50,
+      "clock": 50,
+      "person": 50,
+      "pizza": 50,
+      "sink": 50,
+      "stop sign": 50,
+      "teddy bear": 50,
+      "train": 50,
+      "zebra": 50
+    },
+    "test_forget": {
+      "bed": 50,
+      "bus": 50,
+      "clock": 50,
+      "person": 50,
+      "pizza": 50,
+      "sink": 50,
+      "stop sign": 50,
+      "teddy bear": 50,
+      "train": 50,
+      "zebra": 50
+    }
+  },
+  "n_train_per_forget_class": 50,
+  "n_test_per_forget_class": 50,
+  "macro_guarantee": "every forget class has exactly 50 samples in test_forget",
+  "class_distribution": {
+    "train_forget": {
+      "bed": 50,
+      "bus": 50,
+      "clock": 50,
+      "person": 50,
+      "pizza": 50,
+      "sink": 50,
+      "stop sign": 50,
+      "teddy bear": 50,
+      "train": 50,
+      "zebra": 50
+    },
+    "test_forget": {
+      "bed": 50,
+      "bus": 50,
+      "clock": 50,
+      "person": 50,
+      "pizza": 50,
+      "sink": 50,
+      "stop sign": 50,
+      "teddy bear": 50,
+      "train": 50,
+      "zebra": 50
+    },
+    "train_retain": {
+      "airplane": 113,
+      "toilet": 91,
+      "elephant": 85,
+      "bird": 83,
+      "cat": 46,
+      "vase": 44,
+      "cow": 43,
+      "fire hydrant": 40,
+      "bench": 39,
+      "truck": 38
+    },
+    "test_retain": {
+      "toilet": 57,
+      "airplane": 55,
+      "elephant": 43,
+      "bird": 36,
+      "fire hydrant": 25,
+      "bench": 23,
+      "vase": 22,
+      "horse": 22,
+      "sheep": 20,
+      "truck": 18
+    }
+  }
+}

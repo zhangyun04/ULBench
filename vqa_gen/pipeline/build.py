@@ -1,0 +1,294 @@
+import argparse
+import hashlib
+import json
+import logging
+import random
+from collections import Counter
+from pathlib import Path
+
+import yaml
+
+from vqa_gen.export.jsonl import write_jsonl
+from vqa_gen.internal.types import DatasetItem
+from vqa_gen.ontology.distractor import sample_distractors
+from vqa_gen.pipeline.qc import reset_qc_state, serialize_reject, validate_item
+from vqa_gen.pipeline.split import build_class_level_splits
+from vqa_gen.templates.identity import IDENTITY_QUESTION
+
+logger = logging.getLogger(__name__)
+
+
+def _load_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_yaml(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _stable_seed_from_path(image_relpath):
+    digest = hashlib.sha1(image_relpath.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _build_item_id(image_relpath, wnid, dataset_name="imagenet"):
+    split = image_relpath.split("/", 1)[0]
+    h = hashlib.sha1(image_relpath.encode("utf-8")).hexdigest()[:8]
+    return f"{dataset_name}_{split}_{wnid}_{h}"
+
+
+def _build_hard_pool(gt_wnid, wnid_to_superclass):
+    superclass = wnid_to_superclass.get(gt_wnid)
+    if not superclass:
+        return []
+    return [
+        wnid
+        for wnid, sc in wnid_to_superclass.items()
+        if sc == superclass and wnid != gt_wnid
+    ]
+
+
+def _build_choices(gt_name, distractors, seed):
+    choices = [gt_name] + list(distractors)
+    rng = random.Random(seed)
+    rng.shuffle(choices)
+    return choices
+
+
+def _build_meta(sample, wnid_to_superclass):
+    """Build the meta dict, merging adapter-provided extra_meta if present."""
+    meta = {
+        "synset": sample.wnid,
+        "class_name": sample.class_name,
+        "superclass": wnid_to_superclass.get(sample.wnid, "unknown"),
+    }
+    if sample.extra_meta:
+        meta.update(sample.extra_meta)
+    return meta
+
+
+def _create_adapter(config):
+    source_type = config.get("dataset", {}).get("source_type", "directory")
+
+    if source_type == "directory":
+        from vqa_gen.adapters.imagenet import ImageNetAdapter
+
+        return ImageNetAdapter(
+            imagenet_root=config["paths"]["imagenet_root"],
+            wnid_map_path=config["paths"]["wnid_map"],
+        )
+
+    if source_type == "hf_parquet":
+        from vqa_gen.adapters.imagenet_hf import ImageNetHFAdapter
+
+        ds_cfg = config["dataset"]
+        return ImageNetHFAdapter(
+            hf_data_dir=ds_cfg["hf_data_dir"],
+            splits=ds_cfg.get("splits", ["train", "validation", "test"]),
+        )
+
+    if source_type == "coco":
+        from vqa_gen.adapters.coco import COCOAdapter
+
+        ds_cfg = config["dataset"]
+        return COCOAdapter(
+            coco_root=ds_cfg["root"],
+            splits=ds_cfg.get("splits", ["train", "val"]),
+            annotations=ds_cfg["annotations"],
+            images=ds_cfg["images"],
+            policy=config.get("coco_policy", {}),
+        )
+
+    raise ValueError(f"Unknown source_type: {source_type}")
+
+
+_SOURCE_TYPE_TO_DATASET_NAME = {
+    "directory": "imagenet",
+    "hf_parquet": "imagenet",
+    "coco": "coco",
+}
+
+
+def run(config, max_samples=None):
+    output_root = Path(config["paths"]["output_root"])
+    source_type = config.get("dataset", {}).get("source_type", "directory")
+    dataset_name = _SOURCE_TYPE_TO_DATASET_NAME.get(source_type, source_type)
+
+    ratios = config["splits"]["ratios"]
+    split_seed = int(config["splits"]["seed"])
+    if sorted(ratios.keys()) != ["forget", "retain", "test"]:
+        raise ValueError("Split ratios must include exactly: forget, retain, test.")
+    if abs(sum(float(v) for v in ratios.values()) - 1.0) > 1e-8:
+        raise ValueError("Split ratios must sum to 1.0.")
+
+    hard_k = int(config["choices"]["hard_negatives"])
+    easy_k = int(config["choices"]["easy_negatives"])
+
+    adapter = _create_adapter(config)
+    all_classes = dict(sorted(adapter.wnid_to_class.items()))
+    if not all_classes:
+        raise RuntimeError("No classes found. Check adapter configuration.")
+
+    # Prefer adapter-provided superclass mapping; fall back to JSON file.
+    adapter_superclass = getattr(adapter, "wnid_to_superclass", None)
+    if adapter_superclass is not None:
+        wnid_to_superclass = adapter_superclass
+    else:
+        sc_path = config.get("paths", {}).get("wnid_to_superclass")
+        wnid_to_superclass = _load_json(sc_path) if sc_path else {}
+
+    class_splits = build_class_level_splits(
+        wnids=list(all_classes.keys()),
+        ratios=ratios,
+        seed=split_seed,
+    )
+
+    write_val = bool(config.get("export", {}).get("write_val", False))
+
+    train_items: list[DatasetItem] = []
+    val_items: list[DatasetItem] = []
+    test_items: list[DatasetItem] = []
+    rejects: list[dict] = []
+    reject_reason_counter: Counter = Counter()
+    split_class_sets: dict[str, set] = {"forget": set(), "retain": set(), "test": set()}
+
+    reset_qc_state()
+    count = 0
+
+    for sample in adapter.iter_samples():
+        if max_samples is not None and count >= max_samples:
+            break
+        count += 1
+
+        target_split = class_splits.get(sample.wnid)
+        if target_split is None:
+            continue
+
+        split_class_sets[target_split].add(sample.wnid)
+        local_seed = _stable_seed_from_path(sample.image_relpath)
+
+        hard_pool = _build_hard_pool(sample.wnid, wnid_to_superclass)
+        distractors = sample_distractors(
+            gt_wnid=sample.wnid,
+            hard_pool=hard_pool,
+            all_classes=all_classes,
+            hard_k=hard_k,
+            easy_k=easy_k,
+            seed=local_seed,
+        )
+
+        if len(distractors) < hard_k + easy_k:
+            item = DatasetItem(
+                id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
+                image=sample.image_relpath,
+                question=IDENTITY_QUESTION,
+                choices=[sample.class_name] + distractors,
+                answer_index=0,
+                forgetting_level="object",
+                concept_axis="identity",
+                target_split=target_split,
+                meta=_build_meta(sample, wnid_to_superclass),
+            )
+            reasons = ["insufficient_unique_distractors"]
+            rejects.append(serialize_reject(item, reasons))
+            for r in reasons:
+                reject_reason_counter[r] += 1
+            continue
+
+        choices = _build_choices(sample.class_name, distractors, local_seed)
+        answer_index = choices.index(sample.class_name)
+
+        item = DatasetItem(
+            id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
+            image=sample.image_relpath,
+            question=IDENTITY_QUESTION,
+            choices=choices,
+            answer_index=answer_index,
+            forgetting_level="object",
+            concept_axis="identity",
+            target_split=target_split,
+            meta=_build_meta(sample, wnid_to_superclass),
+        )
+
+        passed, reasons = validate_item(item)
+        if not passed:
+            rejects.append(serialize_reject(item, reasons))
+            for r in reasons:
+                reject_reason_counter[r] += 1
+            continue
+
+        if target_split == "test":
+            test_items.append(item)
+        else:
+            train_items.append(item)
+
+    # --- Write JSONL outputs ---
+    write_jsonl(output_root / "train.jsonl", train_items, public_schema_only=True)
+    if write_val:
+        write_jsonl(output_root / "val.jsonl", val_items, public_schema_only=True)
+    write_jsonl(output_root / "test.jsonl", test_items, public_schema_only=True)
+    (output_root / "internal").mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_root / "internal" / "rejects.jsonl", rejects)
+
+    # --- Compute and write stats ---
+    total_accepted = len(train_items) + len(val_items) + len(test_items)
+    total_processed = total_accepted + len(rejects)
+    reject_rate = len(rejects) / total_processed if total_processed > 0 else 0.0
+
+    split_counts: Counter = Counter()
+    for item in train_items + val_items + test_items:
+        split_counts[item.target_split] += 1
+
+    stats = {
+        "samples_per_split": {
+            "forget": split_counts.get("forget", 0),
+            "retain": split_counts.get("retain", 0),
+            "test": split_counts.get("test", 0),
+        },
+        "classes_per_split": {k: len(v) for k, v in split_class_sets.items()},
+        "total_processed": total_processed,
+        "total_accepted": total_accepted,
+        "total_rejected": len(rejects),
+        "reject_rate": round(reject_rate, 4),
+        "top_reject_reasons": reject_reason_counter.most_common(5),
+    }
+
+    with (output_root / "stats.json").open("w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    logger.info("Pipeline complete. Stats: %s", json.dumps(stats, indent=2))
+    return stats
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Build identity VQA dataset (ImageNet or COCO)."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="vqa_gen/configs/imagenet_identity_mvp.yaml",
+        help="Path to YAML config.",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Limit total samples processed (for dry runs).",
+    )
+    args = parser.parse_args()
+
+    config = _load_yaml(args.config)
+    stats = run(config, max_samples=args.max_samples)
+    print(json.dumps(stats, indent=2))
+
+
+if __name__ == "__main__":
+    main()

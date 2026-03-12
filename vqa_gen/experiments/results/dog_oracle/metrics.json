@@ -1,0 +1,47 @@
+{
+  "forget_classes": [
+    "dog"
+  ],
+  "K": 1,
+  "baseline_normal__forget_macro_acc": 1.0,
+  "baseline_normal__forget_micro_acc": 1.0,
+  "baseline_normal__forget_per_class_acc": {
+    "dog": 1.0
+  },
+  "baseline_normal__forget_per_class_total": {
+    "dog": 50
+  },
+  "baseline_normal__forget_K": 1,
+  "baseline_normal__invalid_rate_forget": 0.0,
+  "baseline_normal__forget_total": 50,
+  "baseline_normal__retain_acc": 1.0,
+  "baseline_normal__retain_macro_acc": 1.0,
+  "baseline_normal__invalid_rate_retain": 0.0,
+  "baseline_normal__retain_total": 50,
+  "oracle_hard__forget_macro_acc": 1.0,
+  "oracle_hard__forget_micro_acc": 1.0,
+  "oracle_hard__forget_per_class_acc": {
+    "dog": 1.0
+  },
+  "oracle_hard__forget_per_class_total": {
+    "dog": 50
+  },
+  "oracle_hard__forget_K": 1,
+  "oracle_hard__invalid_rate_forget": 0.0,
+  "oracle_hard__forget_total": 50,
+  "oracle_hard__retain_acc": 1.0,
+  "oracle_hard__retain_macro_acc": 1.0,
+  "oracle_hard__invalid_rate_retain": 0.0,
+  "oracle_hard__retain_total": 50,
+  "baseline_forget_macro_acc": 1.0,
+  "baseline_retain_acc": 1.0,
+  "oracle_hard_forget_macro_acc": 1.0,
+  "oracle_hard_retain_acc": 1.0,
+  "oracle_hard__forget_pred_distribution": {
+    "0": 15,
+    "1": 10,
+    "2": 10,
+    "3": 15
+  },
+  "oracle_hard__forget_pred_entropy": 1.971
+}

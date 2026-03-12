@@ -1,0 +1,105 @@
+{
+  "mode": "random_k",
+  "seed": 123,
+  "k": 10,
+  "selected_forget_classes": [
+    "bird",
+    "cat",
+    "cow",
+    "fire hydrant",
+    "horse",
+    "pizza",
+    "stop sign",
+    "toilet",
+    "train",
+    "zebra"
+  ],
+  "input_total": 8521,
+  "forget_pool_size": 3887,
+  "retain_pool_size": 4634,
+  "counts": {
+    "train_forget": 1000,
+    "train_retain": 2000,
+    "test_forget": 1000,
+    "test_retain": 500
+  },
+  "per_forget_class_counts": {
+    "train_forget": {
+      "bird": 100,
+      "cat": 100,
+      "cow": 100,
+      "fire hydrant": 100,
+      "horse": 100,
+      "pizza": 100,
+      "stop sign": 100,
+      "toilet": 100,
+      "train": 100,
+      "zebra": 100
+    },
+    "test_forget": {
+      "bird": 100,
+      "cat": 100,
+      "cow": 100,
+      "fire hydrant": 100,
+      "horse": 100,
+      "pizza": 100,
+      "stop sign": 100,
+      "toilet": 100,
+      "train": 100,
+      "zebra": 100
+    }
+  },
+  "n_train_per_forget_class": 100,
+  "n_test_per_forget_class": 100,
+  "macro_guarantee": "every forget class has exactly 100 samples in test_forget",
+  "class_distribution": {
+    "train_forget": {
+      "bird": 100,
+      "cat": 100,
+      "cow": 100,
+      "fire hydrant": 100,
+      "horse": 100,
+      "pizza": 100,
+      "stop sign": 100,
+      "toilet": 100,
+      "train": 100,
+      "zebra": 100
+    },
+    "test_forget": {
+      "bird": 100,
+      "cat": 100,
+      "cow": 100,
+      "fire hydrant": 100,
+      "horse": 100,
+      "pizza": 100,
+      "stop sign": 100,
+      "toilet": 100,
+      "train": 100,
+      "zebra": 100
+    },
+    "train_retain": {
+      "airplane": 249,
+      "elephant": 218,
+      "clock": 172,
+      "vase": 108,
+      "bench": 98,
+      "teddy bear": 89,
+      "dog": 79,
+      "sheep": 78,
+      "truck": 75,
+      "bed": 71
+    },
+    "test_retain": {
+      "airplane": 70,
+      "elephant": 49,
+      "clock": 37,
+      "bench": 25,
+      "vase": 23,
+      "truck": 23,
+      "traffic light": 21,
+      "teddy bear": 20,
+      "bed": 19,
+      "motorcycle": 17
+    }
+  }
+}

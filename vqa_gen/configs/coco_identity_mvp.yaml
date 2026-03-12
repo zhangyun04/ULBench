@@ -1,0 +1,32 @@
+dataset:
+  source_type: "coco"
+  root: "data/coco"
+  splits: ["train", "val"]
+  annotations:
+    train: "annotations/instances_train2017.json"
+    val: "annotations/instances_val2017.json"
+  images:
+    train: "train2017"
+    val: "val2017"
+
+coco_policy:
+  require_single_distinct_category: true
+  min_area_ratio: 0.02
+  max_instances_total: 3
+
+paths:
+  output_root: "vqa_gen/output_coco"
+
+splits:
+  ratios:
+    forget: 0.1
+    retain: 0.8
+    test: 0.1
+  seed: 123
+
+choices:
+  hard_negatives: 2
+  easy_negatives: 1
+
+export:
+  write_val: false
