@@ -65,6 +65,48 @@ def validate_item(item: DatasetItem):
     return passed, sorted(set(reasons))
 
 
+def validate_prebuilt_item(item: DatasetItem):
+    """QC for prebuilt VQA items (e.g. SpatialMQA).
+
+    Relaxes the fixed-4-choices and class_name-in-choices constraints
+    that apply to identity VQA, while keeping the remaining checks.
+    """
+    reasons = []
+
+    if item.id in _SEEN_IDS:
+        reasons.append("duplicate_id")
+
+    if len(item.choices) < 2:
+        reasons.append("too_few_choices")
+
+    normalized_choices = []
+    for choice in item.choices:
+        if isinstance(choice, str):
+            normalized_choices.append(normalize_choice_text(choice))
+        else:
+            normalized_choices.append("")
+
+    if len(set(normalized_choices)) != len(normalized_choices):
+        reasons.append("duplicate_choices_case_insensitive")
+
+    if item.answer_index < 0 or item.answer_index >= len(item.choices):
+        reasons.append("invalid_answer_index")
+
+    for choice in item.choices:
+        if not isinstance(choice, str):
+            reasons.append("choice_not_string")
+            continue
+        if choice.strip() == "":
+            reasons.append("empty_choice")
+        if not _is_utf8(choice):
+            reasons.append("choice_not_utf8")
+
+    passed = len(reasons) == 0
+    if passed:
+        _SEEN_IDS.add(item.id)
+    return passed, sorted(set(reasons))
+
+
 def qc_pass(item):
     passed, _ = validate_item(item)
     return passed
