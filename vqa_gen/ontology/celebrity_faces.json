@@ -1,0 +1,19 @@
+{
+  "Angelina Jolie":     {"display_name": "Angelina Jolie",     "supercategory": "female"},
+  "Brad Pitt":          {"display_name": "Brad Pitt",          "supercategory": "male"},
+  "Denzel Washington":  {"display_name": "Denzel Washington",  "supercategory": "male"},
+  "Hugh Jackman":       {"display_name": "Hugh Jackman",       "supercategory": "male"},
+  "Jennifer Lawrence":  {"display_name": "Jennifer Lawrence",  "supercategory": "female"},
+  "Johnny Depp":        {"display_name": "Johnny Depp",        "supercategory": "male"},
+  "Kate Winslet":       {"display_name": "Kate Winslet",       "supercategory": "female"},
+  "Leonardo DiCaprio":  {"display_name": "Leonardo DiCaprio",  "supercategory": "male"},
+  "Megan Fox":          {"display_name": "Megan Fox",          "supercategory": "female"},
+  "Natalie Portman":    {"display_name": "Natalie Portman",    "supercategory": "female"},
+  "Nicole Kidman":      {"display_name": "Nicole Kidman",      "supercategory": "female"},
+  "Robert Downey Jr":   {"display_name": "Robert Downey Jr",   "supercategory": "male"},
+  "Sandra Bullock":     {"display_name": "Sandra Bullock",     "supercategory": "female"},
+  "Scarlett Johansson": {"display_name": "Scarlett Johansson", "supercategory": "female"},
+  "Tom Cruise":         {"display_name": "Tom Cruise",         "supercategory": "male"},
+  "Tom Hanks":          {"display_name": "Tom Hanks",          "supercategory": "male"},
+  "Will Smith":         {"display_name": "Will Smith",         "supercategory": "male"}
+}

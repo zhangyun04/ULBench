@@ -4,7 +4,7 @@ dataset:
   splits: ["Train", "Test"]
 
 paths:
-  output_root: "vqa_gen/output_mit_indoor67"
+  output_root: "vqa_gen/output/output_mit_indoor67"
   category_metadata: "vqa_gen/ontology/indoor67_categories.json"
 
 vqa_task:

@@ -15,7 +15,7 @@ coco_policy:
   max_instances_total: 3
 
 paths:
-  output_root: "vqa_gen/output_coco"
+  output_root: "vqa_gen/output/output_coco"
 
 splits:
   ratios:

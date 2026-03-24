@@ -1,0 +1,23 @@
+dataset:
+  source_type: "aid"
+  root: "data/AID"
+
+paths:
+  output_root: "vqa_gen/output/output_aid"
+  category_metadata: "vqa_gen/ontology/aid_categories.json"
+
+vqa_task:
+  question: "What type of outdoor scene is shown in the image?"
+  concept_axis: "type_outdoor"
+  forgetting_level: "scene"
+
+splits:
+  ratios: {forget: 0.1, retain: 0.8, test: 0.1}
+  seed: 123
+
+choices:
+  hard_negatives: 2
+  easy_negatives: 1
+
+export:
+  write_val: false

@@ -1,3 +1,13 @@
+# Generated VQA outputs
 vqa_gen/output/
-vqa_gen/output_coco/
+
+# Data directories
 data/
+
+# Claude Code
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

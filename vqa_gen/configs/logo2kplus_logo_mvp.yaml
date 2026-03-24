@@ -1,0 +1,22 @@
+dataset:
+  source_type: "logo2kplus"
+  root: "data/LOGO-2K+/Logo-2K+"
+
+paths:
+  output_root: "vqa_gen/output/output_logo2kplus"
+
+vqa_task:
+  question: "Which brand logo is shown in the image?"
+  concept_axis: "logo"
+  forgetting_level: "privacy"
+
+splits:
+  ratios: {forget: 0.1, retain: 0.8, test: 0.1}
+  seed: 123
+
+choices:
+  hard_negatives: 2
+  easy_negatives: 1
+
+export:
+  write_val: false

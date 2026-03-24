@@ -1,11 +1,12 @@
 dataset:
-  source_type: "spatialmqa"
-  hf_repo: "liuziyan/SpatialMQA"
-  image_root: "data/coco"
-  splits: ["train", "validation", "test"]
+  source_type: "lad"
+  root: "data/LAD"
+  attribute_group: "behaviour"
+  # concept_axis auto-derived as "attribute_behaviour"
+  threshold: 0.3
 
 paths:
-  output_root: "vqa_gen/output/output_spatialmqa"
+  output_root: "vqa_gen/output/output_lad_behaviour"
 
 splits:
   ratios: {forget: 0.1, retain: 0.8, test: 0.1}

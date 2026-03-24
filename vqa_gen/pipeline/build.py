@@ -121,6 +121,44 @@ def _create_adapter(config):
             category_metadata_path=config.get("paths", {}).get("category_metadata"),
         )
 
+    if source_type == "aid":
+        from vqa_gen.adapters.aid import AIDAdapter
+
+        ds_cfg = config["dataset"]
+        return AIDAdapter(
+            dataset_root=ds_cfg["root"],
+            category_metadata_path=config.get("paths", {}).get("category_metadata"),
+        )
+
+    if source_type == "logo2kplus":
+        from vqa_gen.adapters.logo2kplus import Logo2KPlusAdapter
+
+        ds_cfg = config["dataset"]
+        return Logo2KPlusAdapter(
+            dataset_root=ds_cfg["root"],
+        )
+
+    if source_type == "celebrity_faces":
+        from vqa_gen.adapters.celebrity_faces import CelebrityFacesAdapter
+
+        ds_cfg = config["dataset"]
+        return CelebrityFacesAdapter(
+            dataset_root=ds_cfg["root"],
+            category_metadata_path=config.get("paths", {}).get("category_metadata"),
+        )
+
+    if source_type == "lad":
+        from vqa_gen.adapters.lad import LADAdapter
+
+        ds_cfg = config["dataset"]
+        return LADAdapter(
+            dataset_root=ds_cfg["root"],
+            attribute_group=ds_cfg.get("attribute_group", "color"),
+            concept_axis=ds_cfg.get("concept_axis"),
+            domains=ds_cfg.get("domains"),
+            threshold=float(ds_cfg.get("threshold", 0.3)),
+        )
+
     raise ValueError(f"Unknown source_type: {source_type}")
 
 
@@ -130,6 +168,10 @@ _SOURCE_TYPE_TO_DATASET_NAME = {
     "coco": "coco",
     "spatialmqa": "spatialmqa",
     "mit_indoor67": "mit_indoor67",
+    "aid": "aid",
+    "logo2kplus": "logo2kplus",
+    "celebrity_faces": "celebrity_faces",
+    "lad": "lad",
 }
 
 
