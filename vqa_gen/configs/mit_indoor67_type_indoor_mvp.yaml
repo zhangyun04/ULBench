@@ -1,0 +1,24 @@
+dataset:
+  source_type: "mit_indoor67"
+  root: ".claude/worktrees/nifty-einstein/data/mit_indoor67"
+  splits: ["Train", "Test"]
+
+paths:
+  output_root: "vqa_gen/output_mit_indoor67"
+  category_metadata: ".claude/worktrees/nifty-einstein/vqa_gen/ontology/indoor67_categories.json"
+
+vqa_task:
+  question: "What type of indoor scene is shown in the image?"
+  concept_axis: "type_indoor"
+  forgetting_level: "scene"
+
+splits:
+  ratios: {forget: 0.1, retain: 0.8, test: 0.1}
+  seed: 123
+
+choices:
+  hard_negatives: 2
+  easy_negatives: 1
+
+export:
+  write_val: false

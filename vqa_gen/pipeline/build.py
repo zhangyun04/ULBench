@@ -11,7 +11,7 @@ import yaml
 from vqa_gen.export.jsonl import write_jsonl
 from vqa_gen.internal.types import DatasetItem
 from vqa_gen.ontology.distractor import sample_distractors
-from vqa_gen.pipeline.qc import reset_qc_state, serialize_reject, validate_item
+from vqa_gen.pipeline.qc import reset_qc_state, serialize_reject, validate_item, validate_prebuilt_item
 from vqa_gen.pipeline.split import build_class_level_splits
 from vqa_gen.templates.identity import IDENTITY_QUESTION
 
@@ -101,6 +101,26 @@ def _create_adapter(config):
             policy=config.get("coco_policy", {}),
         )
 
+    if source_type == "spatialmqa":
+        from vqa_gen.adapters.spatialmqa import SpatialMQAAdapter
+
+        ds_cfg = config["dataset"]
+        return SpatialMQAAdapter(
+            hf_repo=ds_cfg.get("hf_repo", "liuziyan/SpatialMQA"),
+            image_root=ds_cfg.get("image_root", "."),
+            splits=ds_cfg.get("splits", ["train", "validation", "test"]),
+        )
+
+    if source_type == "mit_indoor67":
+        from vqa_gen.adapters.mit_indoor67 import MITIndoor67Adapter
+
+        ds_cfg = config["dataset"]
+        return MITIndoor67Adapter(
+            dataset_root=ds_cfg["root"],
+            splits=ds_cfg.get("splits", ["Train", "Test"]),
+            category_metadata_path=config.get("paths", {}).get("category_metadata"),
+        )
+
     raise ValueError(f"Unknown source_type: {source_type}")
 
 
@@ -108,6 +128,8 @@ _SOURCE_TYPE_TO_DATASET_NAME = {
     "directory": "imagenet",
     "hf_parquet": "imagenet",
     "coco": "coco",
+    "spatialmqa": "spatialmqa",
+    "mit_indoor67": "mit_indoor67",
 }
 
 
@@ -125,6 +147,12 @@ def run(config, max_samples=None):
 
     hard_k = int(config["choices"]["hard_negatives"])
     easy_k = int(config["choices"]["easy_negatives"])
+
+    # Configurable VQA task labels (backward-compatible defaults).
+    vqa_task = config.get("vqa_task", {})
+    vqa_question = vqa_task.get("question", IDENTITY_QUESTION)
+    vqa_concept_axis = vqa_task.get("concept_axis", "identity")
+    vqa_forgetting_level = vqa_task.get("forgetting_level", "object")
 
     adapter = _create_adapter(config)
     all_classes = dict(sorted(adapter.wnid_to_class.items()))
@@ -169,6 +197,35 @@ def run(config, max_samples=None):
         split_class_sets[target_split].add(sample.wnid)
         local_seed = _stable_seed_from_path(sample.image_relpath)
 
+        # ---- Prebuilt VQA path (e.g. SpatialMQA) ----
+        if sample.prebuilt_qa is not None:
+            pqa = sample.prebuilt_qa
+            item = DatasetItem(
+                id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
+                image=sample.image_relpath,
+                question=pqa.question,
+                choices=list(pqa.choices),
+                answer_index=pqa.answer_index,
+                forgetting_level=pqa.forgetting_level,
+                concept_axis=pqa.concept_axis,
+                target_split=target_split,
+                meta=_build_meta(sample, wnid_to_superclass),
+            )
+
+            passed, reasons = validate_prebuilt_item(item)
+            if not passed:
+                rejects.append(serialize_reject(item, reasons))
+                for r in reasons:
+                    reject_reason_counter[r] += 1
+                continue
+
+            if target_split == "test":
+                test_items.append(item)
+            else:
+                train_items.append(item)
+            continue
+
+        # ---- Standard identity VQA path ----
         hard_pool = _build_hard_pool(sample.wnid, wnid_to_superclass)
         distractors = sample_distractors(
             gt_wnid=sample.wnid,
@@ -183,11 +240,11 @@ def run(config, max_samples=None):
             item = DatasetItem(
                 id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
                 image=sample.image_relpath,
-                question=IDENTITY_QUESTION,
+                question=vqa_question,
                 choices=[sample.class_name] + distractors,
                 answer_index=0,
-                forgetting_level="object",
-                concept_axis="identity",
+                forgetting_level=vqa_forgetting_level,
+                concept_axis=vqa_concept_axis,
                 target_split=target_split,
                 meta=_build_meta(sample, wnid_to_superclass),
             )
@@ -203,11 +260,11 @@ def run(config, max_samples=None):
         item = DatasetItem(
             id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
             image=sample.image_relpath,
-            question=IDENTITY_QUESTION,
+            question=vqa_question,
             choices=choices,
             answer_index=answer_index,
-            forgetting_level="object",
-            concept_axis="identity",
+            forgetting_level=vqa_forgetting_level,
+            concept_axis=vqa_concept_axis,
             target_split=target_split,
             meta=_build_meta(sample, wnid_to_superclass),
         )
