@@ -1,11 +1,11 @@
 dataset:
   source_type: "mit_indoor67"
-  root: ".claude/worktrees/nifty-einstein/data/mit_indoor67"
+  root: "data/mit_indoor67"
   splits: ["Train", "Test"]
 
 paths:
   output_root: "vqa_gen/output_mit_indoor67"
-  category_metadata: ".claude/worktrees/nifty-einstein/vqa_gen/ontology/indoor67_categories.json"
+  category_metadata: "vqa_gen/ontology/indoor67_categories.json"
 
 vqa_task:
   question: "What type of indoor scene is shown in the image?"
