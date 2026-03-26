@@ -150,13 +150,15 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
 
 
 def download_and_extract(data_root: Path, datasets: list[str] | None,
-                         dry_run: bool, no_extract: bool):
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        print("ERROR: huggingface_hub not installed.  pip install huggingface_hub",
-              file=sys.stderr)
-        sys.exit(1)
+                         dry_run: bool, no_extract: bool,
+                         local_hf_repo: Path | None = None):
+    if local_hf_repo is None:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            print("ERROR: huggingface_hub not installed.  pip install huggingface_hub",
+                  file=sys.stderr)
+            sys.exit(1)
 
     data_root.mkdir(parents=True, exist_ok=True)
 
@@ -176,7 +178,10 @@ def download_and_extract(data_root: Path, datasets: list[str] | None,
         print("Nothing to download.")
         return
 
-    print(f"HF repo    : {HF_REPO_ID}")
+    if local_hf_repo:
+        print(f"HF repo    : {local_hf_repo.resolve()} (local)")
+    else:
+        print(f"HF repo    : {HF_REPO_ID}")
     print(f"Data root  : {data_root.resolve()}")
     print(f"Datasets   : {sorted(selected.keys())}")
     print()
@@ -196,18 +201,24 @@ def download_and_extract(data_root: Path, datasets: list[str] | None,
         archives = info["archives"]
         post_extract = info.get("post_extract")
 
-        print(f"[{name}] Downloading from {HF_REPO_ID}/{hf_folder}/ ...")
-
-        # Download the HF folder (contains zip/tar files)
-        snapshot_download(
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            local_dir=str(data_root / "_hf_download"),
-            allow_patterns=[f"{hf_folder}/*"],
-        )
-
-        hf_local = data_root / "_hf_download" / hf_folder
-        print(f"  Downloaded to {hf_local}/")
+        if local_hf_repo:
+            # Use already-cloned local HF repo — skip download entirely
+            hf_local = local_hf_repo / hf_folder
+            print(f"[{name}] Using local repo: {hf_local}/")
+            if not hf_local.exists():
+                print(f"  WARNING: Folder not found in local repo: {hf_local}",
+                      file=sys.stderr)
+                continue
+        else:
+            print(f"[{name}] Downloading from {HF_REPO_ID}/{hf_folder}/ ...")
+            snapshot_download(
+                repo_id=HF_REPO_ID,
+                repo_type="dataset",
+                local_dir=str(data_root / "_hf_download"),
+                allow_patterns=[f"{hf_folder}/*"],
+            )
+            hf_local = data_root / "_hf_download" / hf_folder
+            print(f"  Downloaded to {hf_local}/")
 
         if no_extract:
             print(f"  Skipping extraction (--no_extract).")
@@ -229,9 +240,9 @@ def download_and_extract(data_root: Path, datasets: list[str] | None,
         print(f"  OK: {name} → {dest}/")
         print()
 
-    # Clean up the HF download cache
+    # Clean up the HF download cache (only if we actually downloaded)
     hf_dl = data_root / "_hf_download"
-    if hf_dl.exists() and not no_extract:
+    if hf_dl.exists() and not no_extract and local_hf_repo is None:
         print("Cleaning up download cache ...")
         shutil.rmtree(hf_dl)
 
@@ -264,10 +275,17 @@ def main():
         "--dry_run", action="store_true",
         help="Show what would be downloaded without actually doing it.",
     )
+    parser.add_argument(
+        "--local_hf_repo", default=None,
+        help="Path to a locally cloned HF repo (e.g. VLM_UB/). "
+             "Skips download and extracts directly from this folder.",
+    )
     args = parser.parse_args()
 
     ds_list = [d.strip() for d in args.datasets.split(",")] if args.datasets else None
-    download_and_extract(Path(args.data_root), ds_list, args.dry_run, args.no_extract)
+    local_repo = Path(args.local_hf_repo) if args.local_hf_repo else None
+    download_and_extract(Path(args.data_root), ds_list, args.dry_run, args.no_extract,
+                         local_hf_repo=local_repo)
 
 
 if __name__ == "__main__":
