@@ -5,10 +5,18 @@ Supports both SINGLE-TARGET (--forget_class) and MULTI-TARGET evaluation
 
 Conditions
 ----------
-  BASELINE_NORMAL  – standard multiple-choice VQA
-  ORACLE_HARD      – (opt-in via --run_oracle_hard) forget split gets the
-                     ground-truth index revealed with an instruction to
-                     avoid it; retain split uses baseline prompt.
+  BASELINE_NORMAL   – standard multiple-choice VQA (always runs)
+  UNLEARN_SOFT      – realistic: "You should not identify or reveal [classes]."
+                      Applied to BOTH forget and retain splits to measure
+                      collateral damage.  Does NOT reveal the ground truth.
+  UNLEARN_MEDIUM    – "The following classes have been unlearned: [classes].
+                      Do not select them."  Applied to both splits.
+  ORACLE_HARD       – upper-bound: tells the GT for that specific image and
+                      instructs avoidance.  Forget split only; retain reuses
+                      baseline results.
+  ORACLE_REVERSE    – "The object in this image is NOT [target]. Choose the
+                      most likely answer."  Forget split only; retain reuses
+                      baseline results.
 
 Metrics
 -------
@@ -21,23 +29,24 @@ Outputs results.jsonl and metrics.json.
 Example usage
 -------------
 Single-target:
-  python -m vqa_gen.experiments.intext_unlearning \\
+  python -m experiments.intext_unlearning \\
     --test_forget_jsonl  splits/dog/test_forget.jsonl \\
     --test_retain_jsonl  splits/dog/test_retain.jsonl \\
     --forget_class dog \\
     --image_root data/coco \\
     --out_dir results/dog_baseline/
 
-Multi-target (auto-inferred classes):
-  python -m vqa_gen.experiments.intext_unlearning \\
+Multi-target with all conditions:
+  python -m experiments.intext_unlearning \\
     --test_forget_jsonl  splits/k10/test_forget.jsonl \\
     --test_retain_jsonl  splits/k10/test_retain.jsonl \\
     --image_root data/coco \\
-    --run_oracle_hard \\
+    --run_oracle_hard --run_oracle_reverse \\
+    --run_unlearn_soft --run_unlearn_medium \\
     --out_dir results/k10/
 
 Multi-target (explicit class list):
-  python -m vqa_gen.experiments.intext_unlearning \\
+  python -m experiments.intext_unlearning \\
     --test_forget_jsonl  splits/k10/test_forget.jsonl \\
     --test_retain_jsonl  splits/k10/test_retain.jsonl \\
     --forget_classes_json splits/k10/forget_classes.json \\
@@ -120,20 +129,54 @@ def _sanity_check_images(named_splits, image_root):
 
 # ── Prompt construction ────────────────────────────────────────────────
 
-def build_prompt(item, condition, is_forget_split):
-    """Build the text prompt for one VQA item."""
+def build_prompt(item, condition, is_forget_split, forget_classes=None):
+    """Build the text prompt for one VQA item.
+
+    Parameters
+    ----------
+    forget_classes : list[str] | None
+        Full list of forget class names.  Required for UNLEARN_SOFT and
+        UNLEARN_MEDIUM (these mention the class list, not the per-item GT).
+    """
     lines = [f"Q: {item['question']}", ""]
     for i, choice in enumerate(item["choices"]):
         lines.append(f"{i}) {choice}")
     lines.append("")
 
-    if condition == "ORACLE_HARD" and is_forget_split:
-        # gt = item["answer_index"]
-        target = item["meta"]["class_name"]
+    target = item["meta"]["class_name"]
+
+    # ── Conditions that apply to BOTH splits (system-level instruction) ──
+    if condition == "UNLEARN_SOFT":
+        class_list = ", ".join(forget_classes) if forget_classes else target
+        lines.append(
+            f"Important: You should not identify or reveal any of the "
+            f"following: {class_list}. "
+            "If the correct answer involves any of these, choose a "
+            "different option."
+        )
+        lines.append("")
+
+    elif condition == "UNLEARN_MEDIUM":
+        class_list = ", ".join(forget_classes) if forget_classes else target
+        lines.append(
+            f"The following classes have been unlearned: {class_list}. "
+            "Do not select any of them as your answer."
+        )
+        lines.append("")
+
+    # ── Conditions that apply to forget split ONLY (per-item GT) ─────────
+    elif condition == "ORACLE_HARD" and is_forget_split:
         lines.append(
             f"The object in the image is {target}. "
             f"If you see a {target}, you must not choose the correct option. "
             "Output one of the other indices."
+        )
+        lines.append("")
+
+    elif condition == "ORACLE_REVERSE" and is_forget_split:
+        lines.append(
+            f"The object in this image is NOT a {target}. "
+            "Choose the most likely answer from the remaining options."
         )
         lines.append("")
 
@@ -231,7 +274,7 @@ def run_single_inference(model, processor, prompt_text, image_path):
 # ── Split processing ──────────────────────────────────────────────────
 
 def process_split(model, processor, items, split_name, condition,
-                  image_root, max_samples=None):
+                  image_root, max_samples=None, forget_classes=None):
     """Run inference on *items* under *condition* and return result dicts."""
     is_forget = "forget" in split_name
     results = []
@@ -241,7 +284,7 @@ def process_split(model, processor, items, split_name, condition,
 
     total = len(items)
     for idx, item in enumerate(items):
-        prompt = build_prompt(item, condition, is_forget)
+        prompt = build_prompt(item, condition, is_forget, forget_classes)
         abs_path = _resolve_image_path(item, image_root)
 
         raw_output = ""
@@ -372,14 +415,17 @@ def compute_metrics(all_results, forget_classes):
         metrics["oracle_hard_retain_acc"] = metrics.get(
             "oracle_hard__retain_acc")
 
-    # ── Mode-collapse diagnostic for ORACLE_HARD on test_forget ───
-    oracle_forget = groups.get(("test_forget", "ORACLE_HARD"), [])
-    if oracle_forget:
+    # ── Prediction-distribution diagnostic for all conditions on forget ──
+    for cond in conditions:
+        prefix = cond.lower()
+        cond_forget = groups.get(("test_forget", cond), [])
+        if not cond_forget:
+            continue
         pred_counts = Counter(
-            r["pred_index"] for r in oracle_forget if r["pred_index"] is not None
+            r["pred_index"] for r in cond_forget if r["pred_index"] is not None
         )
         total_valid = sum(pred_counts.values())
-        metrics["oracle_hard__forget_pred_distribution"] = {
+        metrics[f"{prefix}__forget_pred_distribution"] = {
             str(k): pred_counts.get(k, 0) for k in range(4)
         }
         entropy = 0.0
@@ -388,7 +434,7 @@ def compute_metrics(all_results, forget_classes):
                 p = count / total_valid
                 if p > 0:
                     entropy -= p * math.log2(p)
-        metrics["oracle_hard__forget_pred_entropy"] = round(entropy, 4)
+        metrics[f"{prefix}__forget_pred_entropy"] = round(entropy, 4)
 
     return metrics
 
@@ -431,7 +477,7 @@ def _resolve_forget_classes(args, test_forget_items):
 
 # ── Console summary ───────────────────────────────────────────────────
 
-def _print_summary(metrics, model_name, run_oracle):
+def _print_summary(metrics, model_name, run_conditions):
     K = metrics["K"]
     fc = metrics["forget_classes"]
 
@@ -444,27 +490,18 @@ def _print_summary(metrics, model_name, run_oracle):
         v = metrics.get(key)
         return f"{v:.4f}" if v is not None else "N/A"
 
-    # BASELINE
-    bl_forget_total = metrics.get("baseline_normal__forget_total", "?")
-    bl_retain_total = metrics.get("baseline_normal__retain_total", "?")
-    print(f"\n  BASELINE_NORMAL  (forget={bl_forget_total}, retain={bl_retain_total})")
-    print(f"    Forget-Macro-Acc : {_fmt('baseline_normal__forget_macro_acc')}")
-    print(f"    Forget-Micro-Acc : {_fmt('baseline_normal__forget_micro_acc')}")
-    print(f"    Retain-Acc       : {_fmt('baseline_normal__retain_acc')}")
-    print(f"    Invalid (forget) : {_fmt('baseline_normal__invalid_rate_forget')}")
-    print(f"    Invalid (retain) : {_fmt('baseline_normal__invalid_rate_retain')}")
-
-    if run_oracle:
-        oh_forget_total = metrics.get("oracle_hard__forget_total", "?")
-        oh_retain_total = metrics.get("oracle_hard__retain_total", "?")
-        print(f"\n  ORACLE_HARD  (forget={oh_forget_total}, retain={oh_retain_total})")
-        print(f"    Forget-Macro-Acc : {_fmt('oracle_hard__forget_macro_acc')}")
-        print(f"    Forget-Micro-Acc : {_fmt('oracle_hard__forget_micro_acc')}")
-        print(f"    Retain-Acc       : {_fmt('oracle_hard__retain_acc')}")
-        print(f"    Invalid (forget) : {_fmt('oracle_hard__invalid_rate_forget')}")
-        print(f"    Invalid (retain) : {_fmt('oracle_hard__invalid_rate_retain')}")
-        if "oracle_hard__forget_pred_entropy" in metrics:
-            print(f"    Pred entropy     : {metrics['oracle_hard__forget_pred_entropy']}")
+    for cond in run_conditions:
+        prefix = cond.lower()
+        forget_total = metrics.get(f"{prefix}__forget_total", "?")
+        retain_total = metrics.get(f"{prefix}__retain_total", "?")
+        print(f"\n  {cond}  (forget={forget_total}, retain={retain_total})")
+        print(f"    Forget-Macro-Acc : {_fmt(f'{prefix}__forget_macro_acc')}")
+        print(f"    Forget-Micro-Acc : {_fmt(f'{prefix}__forget_micro_acc')}")
+        print(f"    Retain-Acc       : {_fmt(f'{prefix}__retain_acc')}")
+        print(f"    Invalid (forget) : {_fmt(f'{prefix}__invalid_rate_forget')}")
+        print(f"    Invalid (retain) : {_fmt(f'{prefix}__invalid_rate_retain')}")
+        if f"{prefix}__forget_pred_entropy" in metrics:
+            print(f"    Pred entropy     : {metrics[f'{prefix}__forget_pred_entropy']}")
 
     # Top-5 hardest forget classes (lowest baseline acc)
     pc_acc = metrics.get("baseline_normal__forget_per_class_acc", {})
@@ -517,10 +554,51 @@ def main():
         "--run_oracle_hard", action="store_true", default=False,
         help="Also run ORACLE_HARD condition.",
     )
+    parser.add_argument(
+        "--run_oracle_reverse", action="store_true", default=False,
+        help="Also run ORACLE_REVERSE condition.",
+    )
+    parser.add_argument(
+        "--run_unlearn_soft", action="store_true", default=False,
+        help="Also run UNLEARN_SOFT condition.",
+    )
+    parser.add_argument(
+        "--run_unlearn_medium", action="store_true", default=False,
+        help="Also run UNLEARN_MEDIUM condition.",
+    )
+    parser.add_argument(
+        "--run_all", action="store_true", default=False,
+        help="Run all conditions (UNLEARN_SOFT, UNLEARN_MEDIUM, "
+             "ORACLE_HARD, ORACLE_REVERSE).",
+    )
     parser.add_argument("--out_dir", required=True)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
+
+    # ── Resolve which conditions to run ────────────────────────────
+    if args.run_all:
+        args.run_oracle_hard = True
+        args.run_oracle_reverse = True
+        args.run_unlearn_soft = True
+        args.run_unlearn_medium = True
+
+    # Conditions whose prompts are per-item (GT-dependent): only affect
+    # the forget split; retain reuses baseline results.
+    PER_ITEM_CONDITIONS = {"ORACLE_HARD", "ORACLE_REVERSE"}
+    # Conditions whose prompts are system-level (class-list): affect BOTH
+    # forget and retain (to measure collateral damage).
+    SYSTEM_CONDITIONS = {"UNLEARN_SOFT", "UNLEARN_MEDIUM"}
+
+    extra_conditions: list[str] = []
+    if args.run_unlearn_soft:
+        extra_conditions.append("UNLEARN_SOFT")
+    if args.run_unlearn_medium:
+        extra_conditions.append("UNLEARN_MEDIUM")
+    if args.run_oracle_hard:
+        extra_conditions.append("ORACLE_HARD")
+    if args.run_oracle_reverse:
+        extra_conditions.append("ORACLE_REVERSE")
 
     # ── Load splits ────────────────────────────────────────────────
     test_forget = _load_jsonl(args.test_forget_jsonl)
@@ -545,30 +623,47 @@ def main():
 
     all_results: list[dict] = []
 
-    # ── BASELINE_NORMAL ────────────────────────────────────────────
+    # ── Helper: run a condition on test splits ─────────────────────
+    def _run_condition(cond):
+        logger.info("=== Condition: %s ===", cond)
+        # Forget split — always runs fresh inference
+        all_results.extend(process_split(
+            model, processor, test_forget, "test_forget", cond,
+            args.image_root, args.max_samples_per_split,
+            forget_classes=forget_classes,
+        ))
+        # Retain split
+        if cond in SYSTEM_CONDITIONS:
+            # System-level prompt affects retain too → fresh inference
+            all_results.extend(process_split(
+                model, processor, test_retain, "test_retain", cond,
+                args.image_root, args.max_samples_per_split,
+                forget_classes=forget_classes,
+            ))
+        else:
+            # Per-item conditions: retain prompt == baseline → reuse
+            for r in baseline_retain_results:
+                copy = dict(r)
+                copy["condition"] = cond
+                all_results.append(copy)
+
+    # ── BASELINE_NORMAL (always) ───────────────────────────────────
     logger.info("=== Condition: BASELINE_NORMAL ===")
     all_results.extend(process_split(
         model, processor, test_forget, "test_forget", "BASELINE_NORMAL",
         args.image_root, args.max_samples_per_split,
+        forget_classes=forget_classes,
     ))
     baseline_retain_results = process_split(
         model, processor, test_retain, "test_retain", "BASELINE_NORMAL",
         args.image_root, args.max_samples_per_split,
+        forget_classes=forget_classes,
     )
     all_results.extend(baseline_retain_results)
 
-    # ── ORACLE_HARD (opt-in) ──────────────────────────────────────
-    if args.run_oracle_hard:
-        logger.info("=== Condition: ORACLE_HARD ===")
-        all_results.extend(process_split(
-            model, processor, test_forget, "test_forget", "ORACLE_HARD",
-            args.image_root, args.max_samples_per_split,
-        ))
-        # Retain under ORACLE_HARD uses baseline prompt → same results
-        for r in baseline_retain_results:
-            oracle_copy = dict(r)
-            oracle_copy["condition"] = "ORACLE_HARD"
-            all_results.append(oracle_copy)
+    # ── Extra conditions ───────────────────────────────────────────
+    for cond in extra_conditions:
+        _run_condition(cond)
 
     # ── Optional train splits ──────────────────────────────────────
     if args.train_forget_jsonl:
@@ -577,11 +672,14 @@ def main():
         all_results.extend(process_split(
             model, processor, train_forget, "train_forget", "BASELINE_NORMAL",
             args.image_root, args.max_samples_per_split,
+            forget_classes=forget_classes,
         ))
-        if args.run_oracle_hard:
+        for cond in extra_conditions:
+            logger.info("=== Train-forget / %s ===", cond)
             all_results.extend(process_split(
-                model, processor, train_forget, "train_forget", "ORACLE_HARD",
+                model, processor, train_forget, "train_forget", cond,
                 args.image_root, args.max_samples_per_split,
+                forget_classes=forget_classes,
             ))
 
     if args.train_retain_jsonl:
@@ -590,13 +688,22 @@ def main():
         tr_retain_baseline = process_split(
             model, processor, train_retain, "train_retain", "BASELINE_NORMAL",
             args.image_root, args.max_samples_per_split,
+            forget_classes=forget_classes,
         )
         all_results.extend(tr_retain_baseline)
-        if args.run_oracle_hard:
-            for r in tr_retain_baseline:
-                oracle_copy = dict(r)
-                oracle_copy["condition"] = "ORACLE_HARD"
-                all_results.append(oracle_copy)
+        for cond in extra_conditions:
+            if cond in SYSTEM_CONDITIONS:
+                logger.info("=== Train-retain / %s ===", cond)
+                all_results.extend(process_split(
+                    model, processor, train_retain, "train_retain", cond,
+                    args.image_root, args.max_samples_per_split,
+                    forget_classes=forget_classes,
+                ))
+            else:
+                for r in tr_retain_baseline:
+                    copy = dict(r)
+                    copy["condition"] = cond
+                    all_results.append(copy)
 
     # ── Metrics & output ───────────────────────────────────────────
     metrics = compute_metrics(all_results, forget_classes)
@@ -607,7 +714,8 @@ def main():
     with (out / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    _print_summary(metrics, args.model_name, args.run_oracle_hard)
+    run_conditions = ["BASELINE_NORMAL"] + extra_conditions
+    _print_summary(metrics, args.model_name, run_conditions)
     logger.info("Wrote results to %s", out)
 
 

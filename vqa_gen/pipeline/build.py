@@ -12,7 +12,6 @@ from vqa_gen.export.jsonl import write_jsonl
 from vqa_gen.internal.types import DatasetItem
 from vqa_gen.ontology.distractor import sample_distractors
 from vqa_gen.pipeline.qc import reset_qc_state, serialize_reject, validate_item, validate_prebuilt_item
-from vqa_gen.pipeline.split import build_class_level_splits
 from vqa_gen.templates.identity import IDENTITY_QUESTION
 
 logger = logging.getLogger(__name__)
@@ -180,13 +179,6 @@ def run(config, max_samples=None):
     source_type = config.get("dataset", {}).get("source_type", "directory")
     dataset_name = _SOURCE_TYPE_TO_DATASET_NAME.get(source_type, source_type)
 
-    ratios = config["splits"]["ratios"]
-    split_seed = int(config["splits"]["seed"])
-    if sorted(ratios.keys()) != ["forget", "retain", "test"]:
-        raise ValueError("Split ratios must include exactly: forget, retain, test.")
-    if abs(sum(float(v) for v in ratios.values()) - 1.0) > 1e-8:
-        raise ValueError("Split ratios must sum to 1.0.")
-
     hard_k = int(config["choices"]["hard_negatives"])
     easy_k = int(config["choices"]["easy_negatives"])
 
@@ -209,20 +201,10 @@ def run(config, max_samples=None):
         sc_path = config.get("paths", {}).get("wnid_to_superclass")
         wnid_to_superclass = _load_json(sc_path) if sc_path else {}
 
-    class_splits = build_class_level_splits(
-        wnids=list(all_classes.keys()),
-        ratios=ratios,
-        seed=split_seed,
-    )
-
-    write_val = bool(config.get("export", {}).get("write_val", False))
-
-    train_items: list[DatasetItem] = []
-    val_items: list[DatasetItem] = []
-    test_items: list[DatasetItem] = []
+    all_items: list[DatasetItem] = []
     rejects: list[dict] = []
     reject_reason_counter: Counter = Counter()
-    split_class_sets: dict[str, set] = {"forget": set(), "retain": set(), "test": set()}
+    class_set: set[str] = set()
 
     reset_qc_state()
     count = 0
@@ -232,11 +214,7 @@ def run(config, max_samples=None):
             break
         count += 1
 
-        target_split = class_splits.get(sample.wnid)
-        if target_split is None:
-            continue
-
-        split_class_sets[target_split].add(sample.wnid)
+        class_set.add(sample.wnid)
         local_seed = _stable_seed_from_path(sample.image_relpath)
 
         # ---- Prebuilt VQA path (e.g. SpatialMQA) ----
@@ -250,7 +228,7 @@ def run(config, max_samples=None):
                 answer_index=pqa.answer_index,
                 forgetting_level=pqa.forgetting_level,
                 concept_axis=pqa.concept_axis,
-                target_split=target_split,
+                target_split="all",
                 meta=_build_meta(sample, wnid_to_superclass),
             )
 
@@ -261,10 +239,7 @@ def run(config, max_samples=None):
                     reject_reason_counter[r] += 1
                 continue
 
-            if target_split == "test":
-                test_items.append(item)
-            else:
-                train_items.append(item)
+            all_items.append(item)
             continue
 
         # ---- Standard identity VQA path ----
@@ -287,7 +262,7 @@ def run(config, max_samples=None):
                 answer_index=0,
                 forgetting_level=vqa_forgetting_level,
                 concept_axis=vqa_concept_axis,
-                target_split=target_split,
+                target_split="all",
                 meta=_build_meta(sample, wnid_to_superclass),
             )
             reasons = ["insufficient_unique_distractors"]
@@ -307,7 +282,7 @@ def run(config, max_samples=None):
             answer_index=answer_index,
             forgetting_level=vqa_forgetting_level,
             concept_axis=vqa_concept_axis,
-            target_split=target_split,
+            target_split="all",
             meta=_build_meta(sample, wnid_to_superclass),
         )
 
@@ -318,35 +293,21 @@ def run(config, max_samples=None):
                 reject_reason_counter[r] += 1
             continue
 
-        if target_split == "test":
-            test_items.append(item)
-        else:
-            train_items.append(item)
+        all_items.append(item)
 
     # --- Write JSONL outputs ---
-    write_jsonl(output_root / "train.jsonl", train_items, public_schema_only=True)
-    if write_val:
-        write_jsonl(output_root / "val.jsonl", val_items, public_schema_only=True)
-    write_jsonl(output_root / "test.jsonl", test_items, public_schema_only=True)
+    write_jsonl(output_root / "all.jsonl", all_items, public_schema_only=True)
     (output_root / "internal").mkdir(parents=True, exist_ok=True)
     write_jsonl(output_root / "internal" / "rejects.jsonl", rejects)
 
     # --- Compute and write stats ---
-    total_accepted = len(train_items) + len(val_items) + len(test_items)
+    total_accepted = len(all_items)
     total_processed = total_accepted + len(rejects)
     reject_rate = len(rejects) / total_processed if total_processed > 0 else 0.0
 
-    split_counts: Counter = Counter()
-    for item in train_items + val_items + test_items:
-        split_counts[item.target_split] += 1
-
     stats = {
-        "samples_per_split": {
-            "forget": split_counts.get("forget", 0),
-            "retain": split_counts.get("retain", 0),
-            "test": split_counts.get("test", 0),
-        },
-        "classes_per_split": {k: len(v) for k, v in split_class_sets.items()},
+        "total_items": total_accepted,
+        "total_classes": len(class_set),
         "total_processed": total_processed,
         "total_accepted": total_accepted,
         "total_rejected": len(rejects),

@@ -10,13 +10,7 @@ vqa_task:
   concept_axis: "logo"
   forgetting_level: "privacy"
 
-splits:
-  ratios: {forget: 0.1, retain: 0.8, test: 0.1}
-  seed: 123
-
 choices:
   hard_negatives: 2
   easy_negatives: 1
 
-export:
-  write_val: false

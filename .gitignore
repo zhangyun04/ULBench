@@ -1,6 +1,10 @@
 # Generated VQA outputs
 vqa_gen/output/
 
+# Experiment splits & results (large, reproducible)
+experiments/splits/
+experiments/results/
+
 # Data directories
 data/
 

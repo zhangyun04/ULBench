@@ -15,37 +15,37 @@ Example usage
 -------------
 Single-target (unchanged):
   python -m vqa_gen.tools.make_explicit_splits \\
-    --input_jsonl vqa_gen/output_coco/train.jsonl \\
+    --input_jsonl vqa_gen/output/output_coco/all.jsonl \\
     --forget_class dog \\
     --n_forget_test 50 --n_retain_test 50 \\
-    --out_dir vqa_gen/experiments/splits/dog/
+    --out_dir experiments/splits/dog/
 
 Multi-target random_k:
   python -m vqa_gen.tools.make_explicit_splits \\
-    --input_jsonl vqa_gen/output_coco/train.jsonl \\
+    --input_jsonl vqa_gen/output/output_coco/all.jsonl \\
     --k 10 --mode random_k \\
     --n_train_per_forget_class 50 --n_test_per_forget_class 50 \\
     --n_retain_train 2000 --n_retain_test 500 \\
     --seed 123 \\
-    --out_dir vqa_gen/experiments/splits/randomk10_seed123/
+    --out_dir experiments/splits/randomk10_seed123/
 
 Multi-target superclass_balanced_k:
   python -m vqa_gen.tools.make_explicit_splits \\
-    --input_jsonl vqa_gen/output_coco/train.jsonl \\
+    --input_jsonl vqa_gen/output/output_coco/all.jsonl \\
     --k 10 --mode superclass_balanced_k \\
     --n_train_per_forget_class 50 --n_test_per_forget_class 50 \\
     --n_retain_train 2000 --n_retain_test 500 \\
     --seed 123 \\
-    --out_dir vqa_gen/experiments/splits/balancedk10_seed123/
+    --out_dir experiments/splits/balancedk10_seed123/
 
 Manual forget-class list:
   python -m vqa_gen.tools.make_explicit_splits \\
-    --input_jsonl vqa_gen/output_coco/train.jsonl \\
+    --input_jsonl vqa_gen/output/output_coco/all.jsonl \\
     --forget_classes_json path/to/forget_classes.json \\
     --n_train_per_forget_class 50 --n_test_per_forget_class 50 \\
     --n_retain_train 2000 --n_retain_test 500 \\
     --seed 123 \\
-    --out_dir vqa_gen/experiments/splits/manual/
+    --out_dir experiments/splits/manual/
 """
 
 import argparse
@@ -451,7 +451,7 @@ def main():
     )
     parser.add_argument(
         "--input_jsonl", required=True,
-        help="Source JSONL (e.g. output_coco/train.jsonl or combined file).",
+        help="Source JSONL (e.g. output/output_coco/all.jsonl).",
     )
 
     # ── Single-target args (preserved) ─────────────────────────────

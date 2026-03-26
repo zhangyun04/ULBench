@@ -9,16 +9,7 @@ paths:
   wnid_map: "vqa_gen/ontology/wnid_map.json"
   wnid_to_superclass: "vqa_gen/ontology/wnid_to_superclass.json"
 
-splits:
-  ratios:
-    forget: 0.1
-    retain: 0.8
-    test: 0.1
-  seed: 123
-
 choices:
   hard_negatives: 2
   easy_negatives: 1
 
-export:
-  write_val: false
