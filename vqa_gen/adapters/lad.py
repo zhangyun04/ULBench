@@ -301,7 +301,16 @@ class LADAdapter:
                      len(self._class_attr_data))
 
     def _load_images(self):
-        """Parse ``images.txt``."""
+        """Parse ``images.txt``.
+
+        Each line has the format::
+
+            000001, Label_E_41, [113, 0, 688, 1280], images/E_main_memory/xxx.jpg
+
+        The bbox field contains commas, so a naïve `split(",")` breaks.
+        We use the *last* comma-separated token as the image path (always
+        the final field) and the first two tokens as image_id / label_id.
+        """
         path = self.dataset_root / "images.txt"
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -311,7 +320,9 @@ class LADAdapter:
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) < 4:
                     continue
-                image_id, label_id, image_path = parts[0], parts[1], parts[3]
+                image_id = parts[0]
+                label_id = parts[1]
+                image_path = parts[-1]          # last field, after bbox
                 if label_id not in self._label_to_name:
                     continue
                 self._image_entries.append((image_id, label_id, image_path))

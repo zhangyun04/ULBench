@@ -1,0 +1,62 @@
+# VLM Model List for Batch Evaluation (March 2025)
+# Format: <HuggingFace model ID>  #<size_tier>
+# Size tiers: small (≤7B) | medium (8-32B) | large (>32B)
+# Filter with: --size_tier small|medium|large|all
+#
+# ⚠ Verify all IDs at https://huggingface.co before first run.
+#   Uncomment Qwen3-VL lines once available.
+
+# ── Qwen VL (latest: Qwen2.5-VL, Jan 2025) ──────────────────────────────────
+# TODO: Replace with Qwen3-VL once released:
+
+Qwen/Qwen3-VL-2B-Instruct         #small
+Qwen/Qwen3-VL-4B-Instruct         #small
+Qwen/Qwen2.5-VL-7B-Instruct       #small
+Qwen/Qwen3-VL-8B-Instruct         #small
+Qwen/Qwen3-VL-8B-Thinking         #small
+Qwen/Qwen2.5-VL-32B-Instruct      #medium
+Qwen/Qwen3-VL-30B-A3B-Instruct    #medium
+Qwen/Qwen2.5-VL-72B-Instruct      #large
+Qwen/Qwen3-VL-235B-A22B-Instruct  #large
+Qwen/Qwen3-VL-235B-A22B-Thinking  #large
+
+# ── InternVL (latest: InternVL3.5, 2025) ──────────────────────────────────────
+OpenGVLab/InternVL3-5-1B           #small
+OpenGVLab/InternVL3-5-2B           #small
+OpenGVLab/InternVL3-5-8B           #small
+OpenGVLab/InternVL3-5-38B          #large
+OpenGVLab/InternVL3-5-78B          #large
+
+# ── Gemma 3 Vision (latest: Mar 2025, natively multimodal) ───────────────────
+google/gemma-3-4b-it               #small
+google/gemma-3-12b-it              #medium
+google/gemma-3-27b-it              #medium
+
+# ── Llama Vision ──────────────────────────────────────────────────────────────
+# Llama 3.2 Vision (Nov 2024)
+meta-llama/Llama-3.2-11B-Vision-Instruct    #medium
+# Llama 4 Scout (Apr 2025, MoE 17B active / 109B total)
+meta-llama/Llama-4-Scout-17B-16E-Instruct   #medium
+
+# ── Mistral / Pixtral ────────────────────────────────────────────────────────
+mistralai/Mistral-Small-3.1-24B-Instruct-2503  #medium
+mistralai/Pixtral-12B-2409                     #medium
+mistralai/Pixtral-Large-Instruct-2411          #large
+
+# ── Microsoft Phi ─────────────────────────────────────────────────────────────
+microsoft/Phi-4-multimodal-instruct   #small
+
+# ── LLaVA-OneVision ──────────────────────────────────────────────────────────
+llava-hf/llava-onevision-qwen2-7b-ov-hf    #small
+llava-hf/llava-onevision-qwen2-72b-ov-hf   #large
+
+# ── MiniCPM-o (latest: 2.6, late 2024) ───────────────────────────────────────
+openbmb/MiniCPM-o-2_6             #small
+
+# ── DeepSeek-VL2 (MoE, late 2024) ────────────────────────────────────────────
+deepseek-ai/deepseek-vl2-tiny     #small
+deepseek-ai/deepseek-vl2-small    #small
+deepseek-ai/deepseek-vl2          #medium
+
+# ── SmolVLM2 (HuggingFace, Feb 2025) ─────────────────────────────────────────
+HuggingFaceTB/SmolVLM2-2.2B-Instruct   #small
