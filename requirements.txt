@@ -1,0 +1,31 @@
+# ULbench / VLM-UB environment
+# Python 3.9+
+# Install:  conda create -n unlearnpipline python=3.9 && conda activate unlearnpipline
+#           pip install -r requirements.txt
+
+# ── Deep Learning ────────────────────────────────────────────
+torch==2.8.0
+torchvision==0.23.0
+
+# ── HuggingFace ecosystem ───────────────────────────────────
+transformers==4.57.6
+datasets==4.5.0
+huggingface_hub>=1.8.0
+accelerate==1.10.1
+safetensors==0.7.0
+tokenizers==0.22.2
+
+# ── LLM / API ──────────────────────────────────────────────
+openai==2.15.0
+
+# ── Data processing ────────────────────────────────────────
+numpy==2.0.2
+pandas==2.3.3
+pyarrow==21.0.0
+pillow==11.3.0
+
+# ── Utilities ──────────────────────────────────────────────
+pyyaml==6.0.3
+tqdm==4.67.1
+requests==2.32.5
+python-dotenv==1.2.1
