@@ -31,21 +31,6 @@ defaults:
   seed: 42
 
 datasets:
-  # ── ImageNet (1000 classes, ~1300 images/class) ──────────────────────
-  imagenet:
-    input_jsonl: vqa_gen/output/output_imagenet/all.jsonl
-    image_root: data/imagenet-1k
-    forget_unit: class
-    experiments:
-      - name: imagenet_rk10_s42
-        mode: random_k
-        k: 10
-      - name: imagenet_rk50_s42
-        mode: random_k
-        k: 50
-      - name: imagenet_sbk10_s42
-        mode: superclass_balanced_k
-        k: 10
 
   # ── COCO (80 categories, variable images/class) ─────────────────────
   coco:
@@ -103,6 +88,10 @@ datasets:
         n_retain_test: 200
 
   # ── Logo-2K+ (2341 logo classes, variable images/class) ─────────────
+  #    With max_samples=5000, each class gets only ~2 images (round-robin).
+  #    Per-class counts must be very small (1 train + 1 test).
+  #    TIP: For richer splits, re-run logo2kplus separately with a higher
+  #    cap:  bash scripts/02_generate_vqa.sh --only logo2kplus --max_samples 50000
   logo2kplus:
     input_jsonl: vqa_gen/output/output_logo2kplus/all.jsonl
     image_root: "data/LOGO-2K+/Logo-2K+"
@@ -111,8 +100,8 @@ datasets:
       - name: logo2kplus_rk10_s42
         mode: random_k
         k: 10
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
+        n_train_per_forget_class: 1
+        n_test_per_forget_class: 1
         n_retain_train: 1000
         n_retain_test: 300
 
@@ -170,6 +159,8 @@ datasets:
 
   # ── LAD Size (3 values: big, small, middle) ────────────────────────
   #    Only 3 concepts — use single-target (forgetting 1 of 3).
+  #    With max_samples=5000, each value gets ~1667 items;
+  #    retain pool ≈ 3333, so keep n_retain_train+n_retain_test ≤ 2500.
   lad_size:
     input_jsonl: vqa_gen/output/output_lad_size/all.jsonl
     image_root: data/LAD
@@ -178,15 +169,15 @@ datasets:
       - name: lad_size_big
         mode: single_target
         forget_class: "big"
-        n_forget_test: 500
-        n_retain_train: 5000
-        n_retain_test: 1000
+        n_forget_test: 300
+        n_retain_train: 1500
+        n_retain_test: 500
       - name: lad_size_small
         mode: single_target
         forget_class: "small"
-        n_forget_test: 500
-        n_retain_train: 5000
-        n_retain_test: 1000
+        n_forget_test: 300
+        n_retain_train: 1500
+        n_retain_test: 500
 
   # ── LAD Habitat (8 values: ground, ocean, plains, forest, …) ──────
   lad_habitat:

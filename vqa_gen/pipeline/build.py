@@ -215,6 +215,7 @@ def run(config, max_samples=None):
     rejects: list[dict] = []
     reject_reason_counter: Counter = Counter()
     class_set: set[str] = set()
+    forget_concept_set: set[str] = set()
 
     reset_qc_state()
     count = 0
@@ -254,6 +255,7 @@ def run(config, max_samples=None):
                 continue
 
             all_items.append(item)
+            forget_concept_set.add(answer_value)
             continue
 
         # ---- Standard identity VQA path ----
@@ -308,6 +310,7 @@ def run(config, max_samples=None):
             continue
 
         all_items.append(item)
+        forget_concept_set.add(sample.class_name)
 
     # --- Write JSONL outputs ---
     write_jsonl(output_root / "all.jsonl", all_items, public_schema_only=True)
@@ -322,6 +325,8 @@ def run(config, max_samples=None):
     stats = {
         "total_items": total_accepted,
         "total_classes": len(class_set),
+        "total_forget_concepts": len(forget_concept_set),
+        "forget_concepts": sorted(forget_concept_set),
         "total_processed": total_processed,
         "total_accepted": total_accepted,
         "total_rejected": len(rejects),
