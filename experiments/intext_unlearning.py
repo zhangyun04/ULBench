@@ -317,7 +317,7 @@ def process_split(model, processor, items, split_name, condition,
             "is_invalid": pred is None,
             "error": error,
             "raw_output": raw_output,
-            "meta_synset": meta.get("synset", meta.get("class_name", "")),
+            "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
             "meta_superclass": meta.get("superclass", "unknown"),
             "abs_image_path": abs_path,
         })
@@ -462,14 +462,15 @@ def _resolve_forget_classes(args, test_forget_items):
         return [args.forget_class]
 
     classes = sorted({
-        item.get("meta", {}).get("synset",
-            item.get("meta", {}).get("class_name", ""))
+        item.get("meta", {}).get("forget_concept",
+            item.get("meta", {}).get("synset",
+                item.get("meta", {}).get("class_name", "")))
         for item in test_forget_items
     })
     classes = [c for c in classes if c]
     if not classes:
         print("ERROR: cannot infer forget classes from test_forget items "
-              "(no meta.synset found). Pass --forget_class or "
+              "(no meta.forget_concept/synset found). Pass --forget_class or "
               "--forget_classes_json.", file=sys.stderr)
         sys.exit(1)
     return classes

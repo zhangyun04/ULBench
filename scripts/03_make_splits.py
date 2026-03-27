@@ -43,13 +43,30 @@ def _merge_params(defaults: dict, experiment: dict) -> dict:
 def _build_command(input_jsonl: str, experiment: dict, params: dict,
                    out_dir: Path) -> list[str]:
     """Build the CLI command for make_explicit_splits."""
+    mode = experiment["mode"]
+
     cmd = [
         sys.executable, "-m", "vqa_gen.tools.make_explicit_splits",
         "--input_jsonl", input_jsonl,
-        "--k", str(experiment["k"]),
-        "--mode", experiment["mode"],
-        "--n_train_per_forget_class", str(params["n_train_per_forget_class"]),
-        "--n_test_per_forget_class", str(params["n_test_per_forget_class"]),
+    ]
+
+    if mode == "single_target":
+        # Single-target: --forget_class + optional per-experiment overrides
+        cmd += ["--forget_class", experiment["forget_class"]]
+        if "n_forget_test" in experiment:
+            cmd += ["--n_forget_test", str(experiment["n_forget_test"])]
+        if "n_forget_train" in experiment:
+            cmd += ["--n_forget_train", str(experiment["n_forget_train"])]
+    else:
+        # Multi-target: --k, --mode
+        cmd += [
+            "--k", str(experiment["k"]),
+            "--mode", mode,
+            "--n_train_per_forget_class", str(params["n_train_per_forget_class"]),
+            "--n_test_per_forget_class", str(params["n_test_per_forget_class"]),
+        ]
+
+    cmd += [
         "--n_retain_train", str(params["n_retain_train"]),
         "--n_retain_test", str(params["n_retain_test"]),
         "--seed", str(params["seed"]),
@@ -116,7 +133,10 @@ def main():
             print(f"── {name} ──")
             print(f"   Input : {input_jsonl}")
             print(f"   Output: {out_dir}")
-            print(f"   K={exp['k']}, mode={exp['mode']}, seed={params['seed']}")
+            if exp["mode"] == "single_target":
+                print(f"   forget_class={exp['forget_class']!r}, seed={params['seed']}")
+            else:
+                print(f"   K={exp['k']}, mode={exp['mode']}, seed={params['seed']}")
 
             if args.skip_existing and (out_dir / "test_forget.jsonl").exists():
                 print(f"   Status: SKIPPED (already exists)")

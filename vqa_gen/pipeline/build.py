@@ -56,12 +56,22 @@ def _build_choices(gt_name, distractors, seed):
     return choices
 
 
-def _build_meta(sample, wnid_to_superclass):
-    """Build the meta dict, merging adapter-provided extra_meta if present."""
+def _build_meta(sample, wnid_to_superclass, forget_concept=None):
+    """Build the meta dict, merging adapter-provided extra_meta if present.
+
+    Parameters
+    ----------
+    forget_concept : str | None
+        The actual unit of forgetting for this item.  For aligned datasets
+        (COCO, AID, …) this equals ``class_name``.  For attribute datasets
+        (LAD, SpatialMQA) this is the *answer value* (e.g. "brown", "swim").
+        If None, defaults to ``class_name``.
+    """
     meta = {
         "synset": sample.wnid,
         "class_name": sample.class_name,
         "superclass": wnid_to_superclass.get(sample.wnid, "unknown"),
+        "forget_concept": forget_concept if forget_concept is not None else sample.class_name,
     }
     if sample.extra_meta:
         meta.update(sample.extra_meta)
@@ -217,9 +227,12 @@ def run(config, max_samples=None):
         class_set.add(sample.wnid)
         local_seed = _stable_seed_from_path(sample.image_relpath)
 
-        # ---- Prebuilt VQA path (e.g. SpatialMQA) ----
+        # ---- Prebuilt VQA path (e.g. SpatialMQA, LAD attributes) ----
         if sample.prebuilt_qa is not None:
             pqa = sample.prebuilt_qa
+            # For prebuilt QA, the forget concept is the answer value
+            # (attribute/spatial relation), NOT the object identity.
+            answer_value = pqa.choices[pqa.answer_index]
             item = DatasetItem(
                 id=_build_item_id(sample.image_relpath, sample.wnid, dataset_name),
                 image=sample.image_relpath,
@@ -229,7 +242,8 @@ def run(config, max_samples=None):
                 forgetting_level=pqa.forgetting_level,
                 concept_axis=pqa.concept_axis,
                 target_split="all",
-                meta=_build_meta(sample, wnid_to_superclass),
+                meta=_build_meta(sample, wnid_to_superclass,
+                                 forget_concept=answer_value),
             )
 
             passed, reasons = validate_prebuilt_item(item)

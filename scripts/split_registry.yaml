@@ -3,16 +3,23 @@
 #
 # Used by: scripts/03_make_splits.py
 #
+# Splitting is based on meta.forget_concept:
+#   - Aligned datasets (COCO, AID, …): forget_concept = object class name
+#   - Attribute datasets (LAD, SpatialMQA): forget_concept = answer value
+#     (e.g. "brown", "swim", "left of")
+#
 # Structure:
 #   defaults:          shared parameters (can be overridden per-experiment)
 #   datasets:
 #     <dataset_key>:
 #       input_jsonl:   path to all.jsonl from VQA generation
 #       image_root:    root directory for resolving image relative paths
+#       forget_unit:   what forget_concept represents ("class" or "attribute")
 #       experiments:   list of split configurations to generate
 #         - name:      unique split name (output dir = experiments/splits/<name>/)
-#           mode:      random_k | superclass_balanced_k
-#           k:         number of forget classes
+#           mode:      random_k | superclass_balanced_k | single_target
+#           k:         number of forget concepts
+#           forget_class: (single_target only) specific concept to forget
 #           (any field from defaults can be overridden here)
 # =============================================================================
 
@@ -28,6 +35,7 @@ datasets:
   imagenet:
     input_jsonl: vqa_gen/output/output_imagenet/all.jsonl
     image_root: data/imagenet-1k
+    forget_unit: class
     experiments:
       - name: imagenet_rk10_s42
         mode: random_k
@@ -43,6 +51,7 @@ datasets:
   coco:
     input_jsonl: vqa_gen/output/output_coco/all.jsonl
     image_root: data/coco
+    forget_unit: class
     experiments:
       - name: coco_rk10_s42
         mode: random_k
@@ -55,6 +64,7 @@ datasets:
   aid:
     input_jsonl: vqa_gen/output/output_aid/all.jsonl
     image_root: data/AID
+    forget_unit: class
     experiments:
       - name: aid_rk5_s42
         mode: random_k
@@ -68,6 +78,7 @@ datasets:
   mit_indoor67:
     input_jsonl: vqa_gen/output/output_mit_indoor67/all.jsonl
     image_root: data/mit_indoor67
+    forget_unit: class
     experiments:
       - name: mit_indoor67_rk10_s42
         mode: random_k
@@ -81,6 +92,7 @@ datasets:
   celebrity_faces:
     input_jsonl: vqa_gen/output/output_celebrity_faces/all.jsonl
     image_root: "data/celebrity_faces/Celebrity Faces Dataset"
+    forget_unit: class
     experiments:
       - name: celebrity_rk5_s42
         mode: random_k
@@ -94,6 +106,7 @@ datasets:
   logo2kplus:
     input_jsonl: vqa_gen/output/output_logo2kplus/all.jsonl
     image_root: "data/LOGO-2K+/Logo-2K+"
+    forget_unit: class
     experiments:
       - name: logo2kplus_rk10_s42
         mode: random_k
@@ -103,76 +116,134 @@ datasets:
         n_retain_train: 1000
         n_retain_test: 300
 
-  # ── LAD Attribute variants ──────────────────────────────────────────
+  # ══════════════════════════════════════════════════════════════════════
+  # ATTRIBUTE DATASETS — forget_concept = answer value (not object class)
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── LAD Color (11 color values: black, gray, white, brown, …) ──────
   lad_color:
     input_jsonl: vqa_gen/output/output_lad_color/all.jsonl
     image_root: data/LAD
+    forget_unit: attribute   # forget_concept = color value (e.g. "black")
     experiments:
-      - name: lad_color_rk5_s42
+      # Multi-target: forget 3 random colors
+      - name: lad_color_rk3_s42
         mode: random_k
-        k: 5
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
-        n_retain_train: 500
-        n_retain_test: 200
+        k: 3
+        n_train_per_forget_class: 200
+        n_test_per_forget_class: 100
+        n_retain_train: 2000
+        n_retain_test: 500
+      # Single-target examples
+      - name: lad_color_black
+        mode: single_target
+        forget_class: "black"
+        n_forget_test: 200
+        n_retain_train: 2000
+        n_retain_test: 500
+      - name: lad_color_brown
+        mode: single_target
+        forget_class: "brown"
+        n_forget_test: 200
+        n_retain_train: 2000
+        n_retain_test: 500
 
+  # ── LAD Shape (8 values: long, globular, ellipsoidal, cubic, …) ────
   lad_shape:
     input_jsonl: vqa_gen/output/output_lad_shape/all.jsonl
     image_root: data/LAD
+    forget_unit: attribute   # forget_concept = shape value (e.g. "long")
     experiments:
-      - name: lad_shape_rk5_s42
+      - name: lad_shape_rk3_s42
         mode: random_k
-        k: 5
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
-        n_retain_train: 500
-        n_retain_test: 200
+        k: 3
+        n_train_per_forget_class: 200
+        n_test_per_forget_class: 100
+        n_retain_train: 2000
+        n_retain_test: 500
+      - name: lad_shape_long
+        mode: single_target
+        forget_class: "long"
+        n_forget_test: 200
+        n_retain_train: 2000
+        n_retain_test: 500
 
+  # ── LAD Size (3 values: big, small, middle) ────────────────────────
+  #    Only 3 concepts — use single-target (forgetting 1 of 3).
   lad_size:
     input_jsonl: vqa_gen/output/output_lad_size/all.jsonl
     image_root: data/LAD
+    forget_unit: attribute   # forget_concept = size value
     experiments:
-      - name: lad_size_rk5_s42
-        mode: random_k
-        k: 5
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
-        n_retain_train: 500
-        n_retain_test: 200
+      - name: lad_size_big
+        mode: single_target
+        forget_class: "big"
+        n_forget_test: 500
+        n_retain_train: 5000
+        n_retain_test: 1000
+      - name: lad_size_small
+        mode: single_target
+        forget_class: "small"
+        n_forget_test: 500
+        n_retain_train: 5000
+        n_retain_test: 1000
 
+  # ── LAD Habitat (8 values: ground, ocean, plains, forest, …) ──────
   lad_habitat:
     input_jsonl: vqa_gen/output/output_lad_habitat/all.jsonl
     image_root: data/LAD
+    forget_unit: attribute   # forget_concept = habitat value
     experiments:
-      - name: lad_habitat_rk5_s42
+      - name: lad_habitat_rk3_s42
         mode: random_k
-        k: 5
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
-        n_retain_train: 500
-        n_retain_test: 200
+        k: 3
+        n_train_per_forget_class: 100
+        n_test_per_forget_class: 50
+        n_retain_train: 1000
+        n_retain_test: 300
+      - name: lad_habitat_ground
+        mode: single_target
+        forget_class: "the ground"
+        n_forget_test: 200
+        n_retain_train: 1000
+        n_retain_test: 300
 
+  # ── LAD Behaviour (3 values: swim, fly, walk) ──────────────────────
+  #    Only 3 concepts — use single-target.
   lad_behaviour:
     input_jsonl: vqa_gen/output/output_lad_behaviour/all.jsonl
     image_root: data/LAD
+    forget_unit: attribute   # forget_concept = behaviour value
     experiments:
-      - name: lad_behaviour_rk5_s42
-        mode: random_k
-        k: 5
-        n_train_per_forget_class: 30
-        n_test_per_forget_class: 30
-        n_retain_train: 500
-        n_retain_test: 200
+      - name: lad_behaviour_swim
+        mode: single_target
+        forget_class: "swim"
+        n_forget_test: 200
+        n_retain_train: 1000
+        n_retain_test: 300
+      - name: lad_behaviour_fly
+        mode: single_target
+        forget_class: "fly"
+        n_forget_test: 200
+        n_retain_train: 1000
+        n_retain_test: 300
 
-  # ── SpatialMQA (spatial reasoning, uses COCO images) ────────────────
+  # ── SpatialMQA (6 spatial relations: left of, right of, …) ────────
   spatialmqa:
     input_jsonl: vqa_gen/output/output_spatialmqa/all.jsonl
     image_root: data/coco
+    forget_unit: attribute   # forget_concept = spatial relation
     experiments:
-      - name: spatialmqa_rk5_s42
+      - name: spatialmqa_rk3_s42
         mode: random_k
-        k: 5
-        n_train_per_forget_class: 50
+        k: 3
+        n_train_per_forget_class: 100
         n_test_per_forget_class: 50
+        n_retain_train: 1000
+        n_retain_test: 300
+      - name: spatialmqa_leftof
+        mode: single_target
+        forget_class: "left of"
+        n_forget_test: 100
         n_retain_train: 1000
         n_retain_test: 300

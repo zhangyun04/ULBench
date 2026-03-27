@@ -1,4 +1,12 @@
-"""Build explicit experiment splits from a pre-generated identity JSONL.
+"""Build explicit experiment splits from a pre-generated VQA JSONL.
+
+Splitting is based on ``meta.forget_concept`` — the actual unit of
+forgetting.  For aligned datasets (COCO, AID, celebrity, logo, …) this
+equals the object class name.  For attribute datasets (LAD, SpatialMQA)
+this is the *answer value* (e.g. "brown", "swim", "left of").
+
+Falls back to ``meta.synset`` for backward compatibility with older JSONL
+files that lack ``forget_concept``.
 
 Supports two modes:
 
@@ -75,6 +83,17 @@ def _write_jsonl(path, items):
     with path.open("w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def _get_forget_concept(item):
+    """Return the forget concept for an item (backward-compatible).
+
+    Prefers ``meta.forget_concept`` (new field, set by build.py for all
+    datasets).  Falls back to ``meta.synset`` then ``meta.class_name``
+    for older JSONL files.
+    """
+    meta = item.get("meta", {})
+    return meta.get("forget_concept", meta.get("synset", meta.get("class_name", "")))
 
 
 def _check_no_overlap(named_splits):
@@ -191,8 +210,8 @@ def _load_forget_classes_json(path):
 
 def _run_single_target(items, args):
     """Exact original behaviour for --forget_class."""
-    forget_pool = [i for i in items if i["meta"]["synset"] == args.forget_class]
-    retain_pool = [i for i in items if i["meta"]["synset"] != args.forget_class]
+    forget_pool = [i for i in items if _get_forget_concept(i) == args.forget_class]
+    retain_pool = [i for i in items if _get_forget_concept(i) != args.forget_class]
     print(f"Forget pool ({args.forget_class}): {len(forget_pool)}")
     print(f"Retain pool (other classes):       {len(retain_pool)}")
 
@@ -259,10 +278,10 @@ def _run_single_target(items, args):
             "test_retain": len(test_retain),
         },
         "class_distribution": {
-            "train_forget": dict(Counter(i["meta"]["synset"] for i in train_forget)),
-            "test_forget": dict(Counter(i["meta"]["synset"] for i in test_forget)),
-            "train_retain": dict(Counter(i["meta"]["synset"] for i in train_retain).most_common(10)),
-            "test_retain": dict(Counter(i["meta"]["synset"] for i in test_retain).most_common(10)),
+            "train_forget": dict(Counter(_get_forget_concept(i) for i in train_forget)),
+            "test_forget": dict(Counter(_get_forget_concept(i) for i in test_forget)),
+            "train_retain": dict(Counter(_get_forget_concept(i) for i in train_retain).most_common(10)),
+            "test_retain": dict(Counter(_get_forget_concept(i) for i in test_retain).most_common(10)),
         },
     }
     with (out / "split_stats.json").open("w", encoding="utf-8") as f:
@@ -284,7 +303,7 @@ def _run_multi_target(items, forget_classes, mode_name, superclass_allocation,
 
     items_by_class: dict[str, list] = defaultdict(list)
     for item in items:
-        items_by_class[item["meta"]["synset"]].append(item)
+        items_by_class[_get_forget_concept(item)].append(item)
 
     # Validate every requested forget class has enough items
     for cls in forget_classes:
@@ -332,7 +351,7 @@ def _run_multi_target(items, forget_classes, mode_name, superclass_allocation,
             sys.exit(1)
 
     # Retain pool: everything NOT in a forget class
-    retain_pool = [i for i in items if i["meta"]["synset"] not in forget_set]
+    retain_pool = [i for i in items if _get_forget_concept(i) not in forget_set]
     rng = random.Random(args.seed)
     rng.shuffle(retain_pool)
 
@@ -368,7 +387,7 @@ def _run_multi_target(items, forget_classes, mode_name, superclass_allocation,
     # ── forget_classes.json ────────────────────────────────────────
     superclass_of: dict[str, str] = {}
     for item in items:
-        c = item["meta"]["synset"]
+        c = _get_forget_concept(item)
         if c not in superclass_of:
             superclass_of[c] = item["meta"].get("superclass", "unknown")
 
@@ -415,10 +434,10 @@ def _run_multi_target(items, forget_classes, mode_name, superclass_allocation,
             f"every forget class has exactly {n_test_fc} samples in test_forget"
         ),
         "class_distribution": {
-            "train_forget": dict(Counter(i["meta"]["synset"] for i in train_forget).most_common()),
-            "test_forget": dict(Counter(i["meta"]["synset"] for i in test_forget).most_common()),
-            "train_retain": dict(Counter(i["meta"]["synset"] for i in train_retain).most_common(10)),
-            "test_retain": dict(Counter(i["meta"]["synset"] for i in test_retain).most_common(10)),
+            "train_forget": dict(Counter(_get_forget_concept(i) for i in train_forget).most_common()),
+            "test_forget": dict(Counter(_get_forget_concept(i) for i in test_forget).most_common()),
+            "train_retain": dict(Counter(_get_forget_concept(i) for i in train_retain).most_common(10)),
+            "test_retain": dict(Counter(_get_forget_concept(i) for i in test_retain).most_common(10)),
         },
     }
     with (out / "split_stats.json").open("w", encoding="utf-8") as f:
@@ -531,7 +550,7 @@ def main():
     items_by_class: dict[str, list] = defaultdict(list)
     superclass_of: dict[str, str] = {}
     for item in items:
-        c = item["meta"]["synset"]
+        c = _get_forget_concept(item)
         items_by_class[c].append(item)
         if c not in superclass_of:
             superclass_of[c] = item["meta"].get("superclass", "unknown")
