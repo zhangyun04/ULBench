@@ -24,7 +24,18 @@ Metrics
   Retain-Acc       : micro accuracy on test_retain
   Invalid rates    : per split, per condition
 
-Outputs results.jsonl and metrics.json.
+Outputs results.jsonl and metrics.json incrementally (after each condition).
+
+GPU Allocation
+--------------
+  --gpu_ids         Comma-separated GPU ids to use (default: auto-detect).
+  The model is loaded onto the specified GPU(s). For small models (single GPU),
+  the model is pinned to one device for maximum throughput.
+
+Batch Inference
+---------------
+  --batch_size      Number of samples per forward pass (default: 8).
+  Significantly improves GPU utilisation vs single-sample inference.
 
 Example usage
 -------------
@@ -41,16 +52,15 @@ Multi-target with all conditions:
     --test_forget_jsonl  splits/k10/test_forget.jsonl \\
     --test_retain_jsonl  splits/k10/test_retain.jsonl \\
     --image_root data/coco \\
-    --run_oracle_hard --run_oracle_reverse \\
-    --run_unlearn_soft --run_unlearn_medium \\
+    --run_all --batch_size 16 \\
     --out_dir results/k10/
 
-Multi-target (explicit class list):
-  python -m experiments.intext_unlearning \\
+Multi-GPU parallel (called by run_batch_eval.sh):
+  CUDA_VISIBLE_DEVICES=0 python -m experiments.intext_unlearning \\
     --test_forget_jsonl  splits/k10/test_forget.jsonl \\
     --test_retain_jsonl  splits/k10/test_retain.jsonl \\
-    --forget_classes_json splits/k10/forget_classes.json \\
     --image_root data/coco \\
+    --gpu_ids 0 --batch_size 16 --run_all \\
     --out_dir results/k10/
 """
 
@@ -71,6 +81,21 @@ logger = logging.getLogger(__name__)
 
 _ANSWER_RE = re.compile(r"\b([0-3])\b")
 
+# ── GPU tier → number of GPUs required ────────────────────────────────
+# B200 has ~192 GB HBM per card.
+TIER_GPU_MAP = {
+    "small":  1,   # ≤8B  → 1 GPU
+    "medium": 2,   # 8-32B → 2 GPUs
+    "large":  4,   # >32B  → 4 GPUs
+}
+
+# Default batch sizes per tier (B200 192 GB, bf16)
+TIER_BATCH_SIZE = {
+    "small":  16,
+    "medium": 8,
+    "large":  4,
+}
+
 
 # ── I/O helpers ─────────────────────────────────────────────────────────
 
@@ -88,6 +113,15 @@ def _write_jsonl(path, items):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def _append_jsonl(path, items):
+    """Append items to a JSONL file (creates if not exists)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -192,7 +226,17 @@ def parse_answer(raw_output):
 
 # ── Model loading ──────────────────────────────────────────────────────
 
-def load_model_and_processor(model_name):
+def load_model_and_processor(model_name, gpu_ids=None):
+    """Load model onto specified GPU(s).
+
+    Parameters
+    ----------
+    gpu_ids : list[int] | None
+        GPU device indices to use.  If a single GPU, model is pinned to that
+        device directly (no pipeline parallelism overhead).  If multiple GPUs,
+        uses device_map="auto" restricted to those devices.  If None, uses
+        device_map="auto" on all visible GPUs.
+    """
     import warnings
     from transformers import AutoProcessor
     import transformers
@@ -205,24 +249,56 @@ def load_model_and_processor(model_name):
     if cls is None:
         raise RuntimeError("No VL auto-class found in transformers")
 
-    last_exc = None
-    for kwargs in (
-        {"torch_dtype": torch.bfloat16, "device_map": "auto"},
-        {"dtype": torch.bfloat16, "device_map": "auto"},
-    ):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", FutureWarning)
-                model = cls.from_pretrained(model_name, **kwargs)
-            logger.info("Loaded model via %s with %s", cls.__name__, list(kwargs))
-            model.eval()
-            return model, processor
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Load attempt failed (%s): %s", kwargs, exc)
-            continue
+    # Determine loading strategy based on gpu_ids
+    if gpu_ids is not None and len(gpu_ids) == 1:
+        # Single GPU: pin to that device directly (no pipeline parallelism)
+        device = f"cuda:{gpu_ids[0]}"
+        logger.info("Loading model on single device: %s", device)
+        last_exc = None
+        for dtype_key in ("torch_dtype", "dtype"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    model = cls.from_pretrained(
+                        model_name, **{dtype_key: torch.bfloat16},
+                    )
+                model = model.to(device)
+                model.eval()
+                logger.info("Loaded model via %s on %s", cls.__name__, device)
+                return model, processor
+            except Exception as exc:
+                last_exc = exc
+                continue
+        raise RuntimeError(f"Could not load {model_name} on {device}: {last_exc}")
+    else:
+        # Multi-GPU or auto: use device_map with optional max_memory
+        if gpu_ids is not None and len(gpu_ids) > 1:
+            # Restrict to specific GPUs
+            max_memory = {i: "180GiB" for i in gpu_ids}
+            max_memory["cpu"] = "64GiB"
+            logger.info("Loading model across GPUs: %s", gpu_ids)
+        else:
+            max_memory = None
+            logger.info("Loading model with device_map='auto' (all visible GPUs)")
 
-    raise RuntimeError(f"Could not load {model_name}: {last_exc}")
+        last_exc = None
+        for dtype_key in ("torch_dtype", "dtype"):
+            kwargs = {dtype_key: torch.bfloat16, "device_map": "auto"}
+            if max_memory is not None:
+                kwargs["max_memory"] = max_memory
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    model = cls.from_pretrained(model_name, **kwargs)
+                logger.info("Loaded model via %s with %s", cls.__name__, list(kwargs))
+                model.eval()
+                return model, processor
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Load attempt failed (%s): %s", kwargs, exc)
+                continue
+
+        raise RuntimeError(f"Could not load {model_name}: {last_exc}")
 
 
 # ── Inference ──────────────────────────────────────────────────────────
@@ -271,11 +347,95 @@ def run_single_inference(model, processor, prompt_text, image_path):
     return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 
+def run_batch_inference(model, processor, prompt_texts, image_paths):
+    """Run greedy inference on a batch of image+prompt pairs.
+
+    Returns a list of raw output strings, one per input.
+    Failed items return empty string.
+    """
+    images = []
+    texts = []
+    valid_indices = []
+
+    for idx, (prompt, img_path) in enumerate(zip(prompt_texts, image_paths)):
+        try:
+            image = Image.open(img_path).convert("RGB")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text = _apply_chat_template(processor, messages)
+            images.append(image)
+            texts.append(text)
+            valid_indices.append(idx)
+        except Exception as exc:
+            logger.warning("Failed to prepare item %d: %s", idx, exc)
+
+    # If nothing valid, return empty strings
+    results = [""] * len(prompt_texts)
+    if not valid_indices:
+        return results
+
+    try:
+        inputs = processor(
+            text=texts, images=images, return_tensors="pt", padding=True,
+        )
+        # Determine target device
+        device = model.device
+        if hasattr(model, "hf_device_map"):
+            # model is sharded across devices; send to first device
+            first_device = next(iter(model.hf_device_map.values()))
+            if isinstance(first_device, int):
+                device = f"cuda:{first_device}"
+            elif isinstance(first_device, str):
+                device = first_device
+            else:
+                device = "cuda:0"
+        inputs = inputs.to(device)
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+            )
+
+        # Decode: strip input tokens
+        input_len = inputs.input_ids.shape[1]
+        generated_ids = output_ids[:, input_len:]
+        decoded = processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+        for i, vi in enumerate(valid_indices):
+            results[vi] = decoded[i]
+
+    except Exception as exc:
+        logger.warning("Batch inference failed, falling back to single: %s", exc)
+        # Fallback: run one by one
+        for i, vi in enumerate(valid_indices):
+            try:
+                results[vi] = run_single_inference(
+                    model, processor, prompt_texts[vi], image_paths[vi],
+                )
+            except Exception as exc2:
+                logger.warning("Single fallback also failed for item %d: %s", vi, exc2)
+
+    return results
+
+
 # ── Split processing ──────────────────────────────────────────────────
 
 def process_split(model, processor, items, split_name, condition,
-                  image_root, max_samples=None, forget_classes=None):
-    """Run inference on *items* under *condition* and return result dicts."""
+                  image_root, max_samples=None, forget_classes=None,
+                  batch_size=1):
+    """Run inference on *items* under *condition* and return result dicts.
+
+    When batch_size > 1, items are processed in batches for higher throughput.
+    """
     is_forget = "forget" in split_name
     results = []
 
@@ -283,50 +443,147 @@ def process_split(model, processor, items, split_name, condition,
         items = items[:max_samples]
 
     total = len(items)
-    for idx, item in enumerate(items):
-        prompt = build_prompt(item, condition, is_forget, forget_classes)
-        abs_path = _resolve_image_path(item, image_root)
 
-        raw_output = ""
-        error = None
+    if batch_size <= 1:
+        # ── Single-item inference (original path) ────────────────────
+        for idx, item in enumerate(items):
+            prompt = build_prompt(item, condition, is_forget, forget_classes)
+            abs_path = _resolve_image_path(item, image_root)
 
-        if not os.path.exists(abs_path):
-            error = f"image_not_found: {abs_path}"
-        else:
-            try:
-                raw_output = run_single_inference(
-                    model, processor, prompt, abs_path,
+            raw_output = ""
+            error = None
+
+            if not os.path.exists(abs_path):
+                error = f"image_not_found: {abs_path}"
+            else:
+                try:
+                    raw_output = run_single_inference(
+                        model, processor, prompt, abs_path,
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    logger.warning("Inference error on %s: %s", item["id"], error)
+
+            pred = parse_answer(raw_output) if not error else None
+            if pred is None and not error:
+                error = "no_digit_0_3_found"
+            gt = item["answer_index"]
+
+            meta = item.get("meta", {})
+            results.append({
+                "id": item["id"],
+                "split": split_name,
+                "condition": condition,
+                "gt_index": gt,
+                "pred_index": pred,
+                "is_correct": pred == gt if pred is not None else False,
+                "is_invalid": pred is None,
+                "error": error,
+                "raw_output": raw_output,
+                "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                "meta_superclass": meta.get("superclass", "unknown"),
+                "abs_image_path": abs_path,
+            })
+
+            if (idx + 1) % 10 == 0 or idx == total - 1:
+                n_inv = sum(1 for r in results if r["is_invalid"])
+                logger.info(
+                    "[%s / %s] %d/%d processed  (invalid so far: %d)",
+                    split_name, condition, idx + 1, total, n_inv,
                 )
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                logger.warning("Inference error on %s: %s", item["id"], error)
+    else:
+        # ── Batch inference ──────────────────────────────────────────
+        for batch_start in range(0, total, batch_size):
+            batch_items = items[batch_start : batch_start + batch_size]
 
-        pred = parse_answer(raw_output) if not error else None
-        if pred is None and not error:
-            error = "no_digit_0_3_found"
-        gt = item["answer_index"]
+            prompts = []
+            abs_paths = []
+            errors_pre = []  # pre-inference errors (missing image etc.)
 
-        meta = item.get("meta", {})
-        results.append({
-            "id": item["id"],
-            "split": split_name,
-            "condition": condition,
-            "gt_index": gt,
-            "pred_index": pred,
-            "is_correct": pred == gt if pred is not None else False,
-            "is_invalid": pred is None,
-            "error": error,
-            "raw_output": raw_output,
-            "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
-            "meta_superclass": meta.get("superclass", "unknown"),
-            "abs_image_path": abs_path,
-        })
+            for item in batch_items:
+                prompt = build_prompt(item, condition, is_forget, forget_classes)
+                abs_path = _resolve_image_path(item, image_root)
+                prompts.append(prompt)
+                abs_paths.append(abs_path)
+                if not os.path.exists(abs_path):
+                    errors_pre.append(f"image_not_found: {abs_path}")
+                else:
+                    errors_pre.append(None)
 
-        if (idx + 1) % 10 == 0 or idx == total - 1:
+            # Separate valid items for batched inference
+            valid_prompts = []
+            valid_paths = []
+            valid_batch_indices = []
+            for i, err in enumerate(errors_pre):
+                if err is None:
+                    valid_prompts.append(prompts[i])
+                    valid_paths.append(abs_paths[i])
+                    valid_batch_indices.append(i)
+
+            # Run batch inference on valid items
+            raw_outputs_valid = []
+            errors_infer = [None] * len(valid_prompts)
+            if valid_prompts:
+                try:
+                    raw_outputs_valid = run_batch_inference(
+                        model, processor, valid_prompts, valid_paths,
+                    )
+                except Exception as exc:
+                    logger.warning("Batch inference error: %s", exc)
+                    raw_outputs_valid = [""] * len(valid_prompts)
+                    errors_infer = [f"{type(exc).__name__}: {exc}"] * len(valid_prompts)
+
+            # Reassemble results for the full batch
+            valid_iter = iter(range(len(valid_batch_indices)))
+            for i, item in enumerate(batch_items):
+                meta = item.get("meta", {})
+                gt = item["answer_index"]
+
+                if errors_pre[i] is not None:
+                    # Pre-inference error
+                    results.append({
+                        "id": item["id"],
+                        "split": split_name,
+                        "condition": condition,
+                        "gt_index": gt,
+                        "pred_index": None,
+                        "is_correct": False,
+                        "is_invalid": True,
+                        "error": errors_pre[i],
+                        "raw_output": "",
+                        "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                        "meta_superclass": meta.get("superclass", "unknown"),
+                        "abs_image_path": abs_paths[i],
+                    })
+                else:
+                    vi = next(valid_iter)
+                    raw_output = raw_outputs_valid[vi] if vi < len(raw_outputs_valid) else ""
+                    error = errors_infer[vi]
+
+                    pred = parse_answer(raw_output) if not error else None
+                    if pred is None and not error:
+                        error = "no_digit_0_3_found"
+
+                    results.append({
+                        "id": item["id"],
+                        "split": split_name,
+                        "condition": condition,
+                        "gt_index": gt,
+                        "pred_index": pred,
+                        "is_correct": pred == gt if pred is not None else False,
+                        "is_invalid": pred is None,
+                        "error": error,
+                        "raw_output": raw_output,
+                        "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                        "meta_superclass": meta.get("superclass", "unknown"),
+                        "abs_image_path": abs_paths[i],
+                    })
+
+            processed = min(batch_start + batch_size, total)
             n_inv = sum(1 for r in results if r["is_invalid"])
             logger.info(
                 "[%s / %s] %d/%d processed  (invalid so far: %d)",
-                split_name, condition, idx + 1, total, n_inv,
+                split_name, condition, processed, total, n_inv,
             )
 
     return results
@@ -517,6 +774,26 @@ def _print_summary(metrics, model_name, run_conditions):
     print("=" * 62)
 
 
+# ── Incremental save helper ───────────────────────────────────────────
+
+def _save_incremental(out_dir, all_results, forget_classes, condition_name):
+    """Write results.jsonl (full) and metrics.json after each condition."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Overwrite results.jsonl with ALL results accumulated so far
+    _write_jsonl(out / "results.jsonl", all_results)
+
+    # Compute and write metrics on all results so far
+    metrics = compute_metrics(all_results, forget_classes)
+    with (out / "metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    logger.info("Saved incremental results after condition '%s' → %s",
+                condition_name, out)
+    return metrics
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -573,9 +850,26 @@ def main():
              "ORACLE_HARD, ORACLE_REVERSE).",
     )
     parser.add_argument("--out_dir", required=True)
+
+    # ── GPU & batch arguments ──────────────────────────────────────
+    parser.add_argument(
+        "--gpu_ids", default=None,
+        help="Comma-separated GPU device indices (e.g. '0' or '0,1'). "
+             "Default: use all visible GPUs with device_map='auto'.",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=8,
+        help="Batch size for inference (default: 8). "
+             "Set to 1 for single-sample inference.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
+
+    # ── Parse GPU ids ──────────────────────────────────────────────
+    gpu_ids = None
+    if args.gpu_ids is not None:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
 
     # ── Resolve which conditions to run ────────────────────────────
     if args.run_all:
@@ -619,10 +913,40 @@ def main():
 
     # ── Load model ─────────────────────────────────────────────────
     logger.info("Loading model: %s", args.model_name)
-    model, processor = load_model_and_processor(args.model_name)
-    logger.info("Model loaded on device=%s", model.device)
+    model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
+    if hasattr(model, "hf_device_map"):
+        logger.info("Model sharded across: %s",
+                     set(model.hf_device_map.values()))
+    else:
+        logger.info("Model loaded on device=%s", model.device)
 
     all_results: list[dict] = []
+    batch_size = args.batch_size
+
+    # ── Clear previous results file (fresh run) ───────────────────
+    out_path = Path(args.out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    results_file = out_path / "results.jsonl"
+    if results_file.exists():
+        results_file.unlink()
+
+    # ── BASELINE_NORMAL (always) ───────────────────────────────────
+    logger.info("=== Condition: BASELINE_NORMAL ===")
+    all_results.extend(process_split(
+        model, processor, test_forget, "test_forget", "BASELINE_NORMAL",
+        args.image_root, args.max_samples_per_split,
+        forget_classes=forget_classes, batch_size=batch_size,
+    ))
+    baseline_retain_results = process_split(
+        model, processor, test_retain, "test_retain", "BASELINE_NORMAL",
+        args.image_root, args.max_samples_per_split,
+        forget_classes=forget_classes, batch_size=batch_size,
+    )
+    all_results.extend(baseline_retain_results)
+
+    # ── Save after BASELINE_NORMAL ─────────────────────────────────
+    metrics = _save_incremental(
+        args.out_dir, all_results, forget_classes, "BASELINE_NORMAL")
 
     # ── Helper: run a condition on test splits ─────────────────────
     def _run_condition(cond):
@@ -631,7 +955,7 @@ def main():
         all_results.extend(process_split(
             model, processor, test_forget, "test_forget", cond,
             args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes,
+            forget_classes=forget_classes, batch_size=batch_size,
         ))
         # Retain split
         if cond in SYSTEM_CONDITIONS:
@@ -639,7 +963,7 @@ def main():
             all_results.extend(process_split(
                 model, processor, test_retain, "test_retain", cond,
                 args.image_root, args.max_samples_per_split,
-                forget_classes=forget_classes,
+                forget_classes=forget_classes, batch_size=batch_size,
             ))
         else:
             # Per-item conditions: retain prompt == baseline → reuse
@@ -648,23 +972,13 @@ def main():
                 copy["condition"] = cond
                 all_results.append(copy)
 
-    # ── BASELINE_NORMAL (always) ───────────────────────────────────
-    logger.info("=== Condition: BASELINE_NORMAL ===")
-    all_results.extend(process_split(
-        model, processor, test_forget, "test_forget", "BASELINE_NORMAL",
-        args.image_root, args.max_samples_per_split,
-        forget_classes=forget_classes,
-    ))
-    baseline_retain_results = process_split(
-        model, processor, test_retain, "test_retain", "BASELINE_NORMAL",
-        args.image_root, args.max_samples_per_split,
-        forget_classes=forget_classes,
-    )
-    all_results.extend(baseline_retain_results)
+        # ── Save after each condition ──────────────────────────────
+        return _save_incremental(
+            args.out_dir, all_results, forget_classes, cond)
 
     # ── Extra conditions ───────────────────────────────────────────
     for cond in extra_conditions:
-        _run_condition(cond)
+        metrics = _run_condition(cond)
 
     # ── Optional train splits ──────────────────────────────────────
     if args.train_forget_jsonl:
@@ -673,15 +987,17 @@ def main():
         all_results.extend(process_split(
             model, processor, train_forget, "train_forget", "BASELINE_NORMAL",
             args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes,
+            forget_classes=forget_classes, batch_size=batch_size,
         ))
         for cond in extra_conditions:
             logger.info("=== Train-forget / %s ===", cond)
             all_results.extend(process_split(
                 model, processor, train_forget, "train_forget", cond,
                 args.image_root, args.max_samples_per_split,
-                forget_classes=forget_classes,
+                forget_classes=forget_classes, batch_size=batch_size,
             ))
+        _save_incremental(
+            args.out_dir, all_results, forget_classes, "train_forget")
 
     if args.train_retain_jsonl:
         train_retain = _load_jsonl(args.train_retain_jsonl)
@@ -689,7 +1005,7 @@ def main():
         tr_retain_baseline = process_split(
             model, processor, train_retain, "train_retain", "BASELINE_NORMAL",
             args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes,
+            forget_classes=forget_classes, batch_size=batch_size,
         )
         all_results.extend(tr_retain_baseline)
         for cond in extra_conditions:
@@ -698,26 +1014,20 @@ def main():
                 all_results.extend(process_split(
                     model, processor, train_retain, "train_retain", cond,
                     args.image_root, args.max_samples_per_split,
-                    forget_classes=forget_classes,
+                    forget_classes=forget_classes, batch_size=batch_size,
                 ))
             else:
                 for r in tr_retain_baseline:
                     copy = dict(r)
                     copy["condition"] = cond
                     all_results.append(copy)
+        metrics = _save_incremental(
+            args.out_dir, all_results, forget_classes, "train_retain")
 
-    # ── Metrics & output ───────────────────────────────────────────
-    metrics = compute_metrics(all_results, forget_classes)
-
-    out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out / "results.jsonl", all_results)
-    with (out / "metrics.json").open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
+    # ── Final summary ──────────────────────────────────────────────
     run_conditions = ["BASELINE_NORMAL"] + extra_conditions
     _print_summary(metrics, args.model_name, run_conditions)
-    logger.info("Wrote results to %s", out)
+    logger.info("Wrote final results to %s", out_path)
 
 
 if __name__ == "__main__":

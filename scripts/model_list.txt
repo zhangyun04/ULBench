@@ -10,13 +10,20 @@
 # TODO: Replace with Qwen3-VL once released:
 
 Qwen/Qwen3-VL-2B-Instruct         #small
+Qwen/Qwen3-VL-2B-Thinking         #small
+
 Qwen/Qwen3-VL-4B-Instruct         #small
-Qwen/Qwen2.5-VL-7B-Instruct       #small
+Qwen/Qwen3-VL-4B-Thinking         #small
+
 Qwen/Qwen3-VL-8B-Instruct         #small
 Qwen/Qwen3-VL-8B-Thinking         #small
+
 Qwen/Qwen2.5-VL-32B-Instruct      #medium
+Qwen/Qwen2.5-VL-32B-Thinking      #medium
+
 Qwen/Qwen3-VL-30B-A3B-Instruct    #medium
-Qwen/Qwen2.5-VL-72B-Instruct      #large
+Qwen/Qwen3-VL-30B-A3B-Thinking    #medium
+
 Qwen/Qwen3-VL-235B-A22B-Instruct  #large
 Qwen/Qwen3-VL-235B-A22B-Thinking  #large
 

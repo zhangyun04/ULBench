@@ -13,6 +13,9 @@
 #   bash scripts/04_run_experiments.sh --conditions BASELINE_NORMAL,ORACLE_HARD
 #   bash scripts/04_run_experiments.sh --dry_run
 #   bash scripts/04_run_experiments.sh --skip_existing
+#   bash scripts/04_run_experiments.sh --num_gpus 8             # total GPUs available
+#   bash scripts/04_run_experiments.sh --batch_size 16          # override batch size
+#   bash scripts/04_run_experiments.sh --sequential             # disable parallel
 # =============================================================================
 set -euo pipefail
 
@@ -22,9 +25,12 @@ CONDITIONS="all"
 MODELS_FILE="scripts/model_list.txt"
 RESULTS_DIR="experiments/results"
 MAX_SAMPLES=""
+NUM_GPUS=8
+BATCH_SIZE=""
 ONLY=""
 DRY_RUN=false
 SKIP_EXISTING=false
+SEQUENTIAL=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,9 +40,12 @@ while [[ $# -gt 0 ]]; do
         --models)         MODELS_FILE="$2";    shift 2 ;;
         --results_dir)    RESULTS_DIR="$2";    shift 2 ;;
         --max_samples)    MAX_SAMPLES="$2";    shift 2 ;;
+        --num_gpus)       NUM_GPUS="$2";       shift 2 ;;
+        --batch_size)     BATCH_SIZE="$2";     shift 2 ;;
         --only)           ONLY="$2";           shift 2 ;;
         --dry_run)        DRY_RUN=true;        shift ;;
         --skip_existing)  SKIP_EXISTING=true;  shift ;;
+        --sequential)     SEQUENTIAL=true;     shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -48,9 +57,11 @@ echo "  Size tier   : $SIZE_TIER"
 echo "  Conditions  : $CONDITIONS"
 echo "  Models      : $MODELS_FILE"
 echo "  Results dir : $RESULTS_DIR"
+echo "  Num GPUs    : $NUM_GPUS"
 echo "  Filter      : ${ONLY:-all}"
 echo "  Dry run     : $DRY_RUN"
 echo "  Skip exist  : $SKIP_EXISTING"
+echo "  Sequential  : $SEQUENTIAL"
 echo "================================================================"
 echo ""
 
@@ -112,14 +123,21 @@ while IFS=$'\t' read -r split_name image_root; do
     if [[ -n "$MAX_SAMPLES" ]]; then
         EXTRA_FLAGS="$EXTRA_FLAGS --max_samples $MAX_SAMPLES"
     fi
+    if [[ -n "$BATCH_SIZE" ]]; then
+        EXTRA_FLAGS="$EXTRA_FLAGS --batch_size $BATCH_SIZE"
+    fi
+    if [[ "$SEQUENTIAL" == true ]]; then
+        EXTRA_FLAGS="$EXTRA_FLAGS --sequential"
+    fi
 
     cmd="bash scripts/run_batch_eval.sh \
         --split_dir $split_dir \
-        --image_root $image_root \
+        --image_root \"$image_root\" \
         --conditions $CONDITIONS \
         --size_tier $SIZE_TIER \
         --models $MODELS_FILE \
         --results_dir $RESULTS_DIR \
+        --num_gpus $NUM_GPUS \
         $EXTRA_FLAGS"
 
     echo "CMD: $cmd"
