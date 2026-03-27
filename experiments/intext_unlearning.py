@@ -71,6 +71,7 @@ import math
 import os
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -431,10 +432,11 @@ def run_batch_inference(model, processor, prompt_texts, image_paths):
 
 def process_split(model, processor, items, split_name, condition,
                   image_root, max_samples=None, forget_classes=None,
-                  batch_size=1):
+                  batch_size=1, model_tag=""):
     """Run inference on *items* under *condition* and return result dicts.
 
     When batch_size > 1, items are processed in batches for higher throughput.
+    *model_tag* is a short identifier shown in log lines for multi-GPU runs.
     """
     is_forget = "forget" in split_name
     results = []
@@ -443,6 +445,8 @@ def process_split(model, processor, items, split_name, condition,
         items = items[:max_samples]
 
     total = len(items)
+    tag = f"[{model_tag}] " if model_tag else ""
+    t_start = time.time()
 
     if batch_size <= 1:
         # ── Single-item inference (original path) ────────────────────
@@ -487,9 +491,13 @@ def process_split(model, processor, items, split_name, condition,
 
             if (idx + 1) % 10 == 0 or idx == total - 1:
                 n_inv = sum(1 for r in results if r["is_invalid"])
+                elapsed = time.time() - t_start
+                speed = (idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (total - idx - 1) / speed if speed > 0 else 0
                 logger.info(
-                    "[%s / %s] %d/%d processed  (invalid so far: %d)",
-                    split_name, condition, idx + 1, total, n_inv,
+                    "%s%s / %s  %d/%d  (invalid=%d  %.1f it/s  ETA %.0fs)",
+                    tag, split_name, condition, idx + 1, total,
+                    n_inv, speed, eta,
                 )
     else:
         # ── Batch inference ──────────────────────────────────────────
@@ -581,9 +589,13 @@ def process_split(model, processor, items, split_name, condition,
 
             processed = min(batch_start + batch_size, total)
             n_inv = sum(1 for r in results if r["is_invalid"])
+            elapsed = time.time() - t_start
+            speed = processed / elapsed if elapsed > 0 else 0
+            eta = (total - processed) / speed if speed > 0 else 0
             logger.info(
-                "[%s / %s] %d/%d processed  (invalid so far: %d)",
-                split_name, condition, processed, total, n_inv,
+                "%s%s / %s  %d/%d  (invalid=%d  %.1f it/s  ETA %.0fs)",
+                tag, split_name, condition, processed, total,
+                n_inv, speed, eta,
             )
 
     return results
@@ -895,15 +907,19 @@ def main():
     if args.run_oracle_reverse:
         extra_conditions.append("ORACLE_REVERSE")
 
+    # ── Short model tag for log lines ─────────────────────────────
+    model_tag = args.model_name.split("/")[-1]
+
     # ── Load splits ────────────────────────────────────────────────
     test_forget = _load_jsonl(args.test_forget_jsonl)
     test_retain = _load_jsonl(args.test_retain_jsonl)
-    logger.info("Test forget: %d items, Test retain: %d items",
-                len(test_forget), len(test_retain))
+    logger.info("[%s] Test forget: %d items, Test retain: %d items",
+                model_tag, len(test_forget), len(test_retain))
 
     # ── Resolve forget classes ─────────────────────────────────────
     forget_classes = _resolve_forget_classes(args, test_forget)
-    logger.info("Forget classes (K=%d): %s", len(forget_classes), forget_classes)
+    logger.info("[%s] Forget classes (K=%d): %s",
+                model_tag, len(forget_classes), forget_classes)
 
     # ── Early sanity check ─────────────────────────────────────────
     _sanity_check_images(
@@ -912,13 +928,14 @@ def main():
     )
 
     # ── Load model ─────────────────────────────────────────────────
-    logger.info("Loading model: %s", args.model_name)
+    logger.info("[%s] Loading model: %s (GPUs: %s, batch_size: %d)",
+                model_tag, args.model_name, gpu_ids or "auto", batch_size)
     model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
     if hasattr(model, "hf_device_map"):
-        logger.info("Model sharded across: %s",
-                     set(model.hf_device_map.values()))
+        logger.info("[%s] Model sharded across: %s",
+                     model_tag, set(model.hf_device_map.values()))
     else:
-        logger.info("Model loaded on device=%s", model.device)
+        logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
 
     all_results: list[dict] = []
     batch_size = args.batch_size
@@ -930,40 +947,45 @@ def main():
     if results_file.exists():
         results_file.unlink()
 
+    # ── Common kwargs ─────────────────────────────────────────────
+    _kw = dict(
+        image_root=args.image_root,
+        max_samples=args.max_samples_per_split,
+        forget_classes=forget_classes,
+        batch_size=batch_size,
+        model_tag=model_tag,
+    )
+
     # ── BASELINE_NORMAL (always) ───────────────────────────────────
-    logger.info("=== Condition: BASELINE_NORMAL ===")
+    logger.info("[%s] ═══ Starting condition: BASELINE_NORMAL ═══", model_tag)
+    cond_t0 = time.time()
     all_results.extend(process_split(
-        model, processor, test_forget, "test_forget", "BASELINE_NORMAL",
-        args.image_root, args.max_samples_per_split,
-        forget_classes=forget_classes, batch_size=batch_size,
+        model, processor, test_forget, "test_forget", "BASELINE_NORMAL", **_kw,
     ))
     baseline_retain_results = process_split(
-        model, processor, test_retain, "test_retain", "BASELINE_NORMAL",
-        args.image_root, args.max_samples_per_split,
-        forget_classes=forget_classes, batch_size=batch_size,
+        model, processor, test_retain, "test_retain", "BASELINE_NORMAL", **_kw,
     )
     all_results.extend(baseline_retain_results)
 
-    # ── Save after BASELINE_NORMAL ─────────────────────────────────
+    logger.info("[%s] ═══ BASELINE_NORMAL done (%.0fs) — saving ═══",
+                model_tag, time.time() - cond_t0)
     metrics = _save_incremental(
         args.out_dir, all_results, forget_classes, "BASELINE_NORMAL")
 
     # ── Helper: run a condition on test splits ─────────────────────
     def _run_condition(cond):
-        logger.info("=== Condition: %s ===", cond)
+        logger.info("[%s] ═══ Starting condition: %s ═══", model_tag, cond)
+        cond_t0 = time.time()
+
         # Forget split — always runs fresh inference
         all_results.extend(process_split(
-            model, processor, test_forget, "test_forget", cond,
-            args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes, batch_size=batch_size,
+            model, processor, test_forget, "test_forget", cond, **_kw,
         ))
         # Retain split
         if cond in SYSTEM_CONDITIONS:
             # System-level prompt affects retain too → fresh inference
             all_results.extend(process_split(
-                model, processor, test_retain, "test_retain", cond,
-                args.image_root, args.max_samples_per_split,
-                forget_classes=forget_classes, batch_size=batch_size,
+                model, processor, test_retain, "test_retain", cond, **_kw,
             ))
         else:
             # Per-item conditions: retain prompt == baseline → reuse
@@ -972,7 +994,8 @@ def main():
                 copy["condition"] = cond
                 all_results.append(copy)
 
-        # ── Save after each condition ──────────────────────────────
+        logger.info("[%s] ═══ %s done (%.0fs) — saving ═══",
+                    model_tag, cond, time.time() - cond_t0)
         return _save_incremental(
             args.out_dir, all_results, forget_classes, cond)
 
@@ -983,38 +1006,34 @@ def main():
     # ── Optional train splits ──────────────────────────────────────
     if args.train_forget_jsonl:
         train_forget = _load_jsonl(args.train_forget_jsonl)
-        logger.info("=== Train-forget evaluation (%d items) ===", len(train_forget))
+        logger.info("[%s] === Train-forget evaluation (%d items) ===",
+                    model_tag, len(train_forget))
         all_results.extend(process_split(
             model, processor, train_forget, "train_forget", "BASELINE_NORMAL",
-            args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes, batch_size=batch_size,
+            **_kw,
         ))
         for cond in extra_conditions:
-            logger.info("=== Train-forget / %s ===", cond)
+            logger.info("[%s] === Train-forget / %s ===", model_tag, cond)
             all_results.extend(process_split(
-                model, processor, train_forget, "train_forget", cond,
-                args.image_root, args.max_samples_per_split,
-                forget_classes=forget_classes, batch_size=batch_size,
+                model, processor, train_forget, "train_forget", cond, **_kw,
             ))
         _save_incremental(
             args.out_dir, all_results, forget_classes, "train_forget")
 
     if args.train_retain_jsonl:
         train_retain = _load_jsonl(args.train_retain_jsonl)
-        logger.info("=== Train-retain evaluation (%d items) ===", len(train_retain))
+        logger.info("[%s] === Train-retain evaluation (%d items) ===",
+                    model_tag, len(train_retain))
         tr_retain_baseline = process_split(
             model, processor, train_retain, "train_retain", "BASELINE_NORMAL",
-            args.image_root, args.max_samples_per_split,
-            forget_classes=forget_classes, batch_size=batch_size,
+            **_kw,
         )
         all_results.extend(tr_retain_baseline)
         for cond in extra_conditions:
             if cond in SYSTEM_CONDITIONS:
-                logger.info("=== Train-retain / %s ===", cond)
+                logger.info("[%s] === Train-retain / %s ===", model_tag, cond)
                 all_results.extend(process_split(
-                    model, processor, train_retain, "train_retain", cond,
-                    args.image_root, args.max_samples_per_split,
-                    forget_classes=forget_classes, batch_size=batch_size,
+                    model, processor, train_retain, "train_retain", cond, **_kw,
                 ))
             else:
                 for r in tr_retain_baseline:
@@ -1027,7 +1046,7 @@ def main():
     # ── Final summary ──────────────────────────────────────────────
     run_conditions = ["BASELINE_NORMAL"] + extra_conditions
     _print_summary(metrics, args.model_name, run_conditions)
-    logger.info("Wrote final results to %s", out_path)
+    logger.info("[%s] Done. Results in %s", model_tag, out_path)
 
 
 if __name__ == "__main__":
