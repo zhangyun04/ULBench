@@ -26,16 +26,18 @@ Metrics
 
 Outputs results.jsonl and metrics.json incrementally (after each condition).
 
-GPU Allocation
---------------
-  --gpu_ids         Comma-separated GPU ids to use (default: auto-detect).
-  The model is loaded onto the specified GPU(s). For small models (single GPU),
-  the model is pinned to one device for maximum throughput.
+Data-parallel MapReduce
+-----------------------
+  --num_workers N   Spawn N worker processes, each loads the model on a
+                    separate GPU and processes 1/N of the data.  Results
+                    are merged (reduced) into a single output.  Default: 1
+                    (single-process, backward compatible).
 
-Batch Inference
----------------
-  --batch_size      Number of samples per forward pass (default: 8).
-  Significantly improves GPU utilisation vs single-sample inference.
+  For a single small model on 8×B200:
+    python -m experiments.intext_unlearning ... --num_workers 8
+
+  The shell scripts (run_batch_eval.sh) set this automatically based on
+  model tier: small → 8 workers, medium → 4, large → 2.
 
 Example usage
 -------------
@@ -47,20 +49,12 @@ Single-target:
     --image_root data/coco \\
     --out_dir results/dog_baseline/
 
-Multi-target with all conditions:
+Multi-target with all conditions + 8-GPU data parallel:
   python -m experiments.intext_unlearning \\
     --test_forget_jsonl  splits/k10/test_forget.jsonl \\
     --test_retain_jsonl  splits/k10/test_retain.jsonl \\
     --image_root data/coco \\
-    --run_all --batch_size 16 \\
-    --out_dir results/k10/
-
-Multi-GPU parallel (called by run_batch_eval.sh):
-  CUDA_VISIBLE_DEVICES=0 python -m experiments.intext_unlearning \\
-    --test_forget_jsonl  splits/k10/test_forget.jsonl \\
-    --test_retain_jsonl  splits/k10/test_retain.jsonl \\
-    --image_root data/coco \\
-    --gpu_ids 0 --batch_size 16 --run_all \\
+    --run_all --num_workers 8 --batch_size 16 \\
     --out_dir results/k10/
 """
 
@@ -70,6 +64,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -806,7 +801,271 @@ def _save_incremental(out_dir, all_results, forget_classes, condition_name):
     return metrics
 
 
-# ── Main ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# MapReduce: data-parallel multi-GPU for a SINGLE model
+# ══════════════════════════════════════════════════════════════════════
+
+def _shard_items(items, shard_idx, num_shards):
+    """Return the shard_idx-th slice of items (round-robin assignment)."""
+    return [item for i, item in enumerate(items) if i % num_shards == shard_idx]
+
+
+def _run_worker_subprocess(args, shard_idx, num_shards, gpu_id, shard_dir):
+    """Launch a subprocess that runs this same script in --_worker mode.
+
+    The worker processes shard_idx/num_shards of the data on gpu_id and
+    writes its partial results to shard_dir/results_shard_{shard_idx}.jsonl.
+    """
+    cmd = [
+        sys.executable, "-m", "experiments.intext_unlearning",
+        "--test_forget_jsonl", args.test_forget_jsonl,
+        "--test_retain_jsonl", args.test_retain_jsonl,
+        "--image_root", args.image_root,
+        "--model_name", args.model_name,
+        "--seed", str(args.seed),
+        "--gpu_ids", str(gpu_id),
+        "--batch_size", str(args.batch_size),
+        "--out_dir", shard_dir,
+        "--_worker",
+        "--_shard_idx", str(shard_idx),
+        "--_num_shards", str(num_shards),
+    ]
+    if args.max_samples_per_split is not None:
+        cmd += ["--max_samples_per_split", str(args.max_samples_per_split)]
+    if args.forget_class:
+        cmd += ["--forget_class", args.forget_class]
+    if args.forget_classes_json:
+        cmd += ["--forget_classes_json", args.forget_classes_json]
+    if args.train_forget_jsonl:
+        cmd += ["--train_forget_jsonl", args.train_forget_jsonl]
+    if args.train_retain_jsonl:
+        cmd += ["--train_retain_jsonl", args.train_retain_jsonl]
+
+    # Forward condition flags
+    if args.run_all:
+        cmd += ["--run_all"]
+    else:
+        if args.run_oracle_hard:
+            cmd += ["--run_oracle_hard"]
+        if args.run_oracle_reverse:
+            cmd += ["--run_oracle_reverse"]
+        if args.run_unlearn_soft:
+            cmd += ["--run_unlearn_soft"]
+        if args.run_unlearn_medium:
+            cmd += ["--run_unlearn_medium"]
+
+    log_file = os.path.join(shard_dir, f"worker_{shard_idx}.log")
+    Path(shard_dir).mkdir(parents=True, exist_ok=True)
+
+    logger.info("Spawning worker %d/%d on GPU %d  (log: %s)",
+                shard_idx, num_shards, gpu_id, log_file)
+
+    with open(log_file, "w") as lf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)},
+        )
+    return proc, log_file
+
+
+def _reduce_shards(shard_dir, num_shards, out_dir, forget_classes, run_conditions):
+    """Merge per-shard results into final results.jsonl + metrics.json.
+
+    Each shard wrote results_shard_{i}.jsonl containing ALL its results
+    (across all conditions).
+    """
+    all_results = []
+    for i in range(num_shards):
+        shard_file = Path(shard_dir) / f"shard_{i}" / "results.jsonl"
+        if shard_file.exists():
+            all_results.extend(_load_jsonl(shard_file))
+            logger.info("Loaded shard %d: %d results from %s",
+                        i, len(_load_jsonl(shard_file)), shard_file)
+        else:
+            logger.warning("Shard %d results not found: %s", i, shard_file)
+
+    # Sort by original item order (by id) to ensure deterministic output
+    all_results.sort(key=lambda r: (r["condition"], r["split"], r["id"]))
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(out / "results.jsonl", all_results)
+
+    metrics = compute_metrics(all_results, forget_classes)
+    with (out / "metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    logger.info("Reduced %d shard results → %s  (%d total items)",
+                num_shards, out, len(all_results))
+    return metrics
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Worker mode: single-GPU shard processor
+# ══════════════════════════════════════════════════════════════════════
+
+def _run_as_worker(args):
+    """Run as a worker: process only shard_idx/num_shards of each split."""
+    shard_idx = args._shard_idx
+    num_shards = args._num_shards
+    model_tag = f"{args.model_name.split('/')[-1]}:w{shard_idx}"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [worker-{shard_idx}] %(levelname)s: %(message)s",
+    )
+
+    torch.manual_seed(args.seed + shard_idx)
+
+    # Parse GPU ids
+    gpu_ids = None
+    if args.gpu_ids is not None:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+
+    # Resolve conditions
+    if args.run_all:
+        args.run_oracle_hard = True
+        args.run_oracle_reverse = True
+        args.run_unlearn_soft = True
+        args.run_unlearn_medium = True
+
+    PER_ITEM_CONDITIONS = {"ORACLE_HARD", "ORACLE_REVERSE"}
+    SYSTEM_CONDITIONS = {"UNLEARN_SOFT", "UNLEARN_MEDIUM"}
+
+    extra_conditions: list[str] = []
+    if args.run_unlearn_soft:
+        extra_conditions.append("UNLEARN_SOFT")
+    if args.run_unlearn_medium:
+        extra_conditions.append("UNLEARN_MEDIUM")
+    if args.run_oracle_hard:
+        extra_conditions.append("ORACLE_HARD")
+    if args.run_oracle_reverse:
+        extra_conditions.append("ORACLE_REVERSE")
+
+    # Load full data then take shard
+    test_forget_full = _load_jsonl(args.test_forget_jsonl)
+    test_retain_full = _load_jsonl(args.test_retain_jsonl)
+
+    if args.max_samples_per_split is not None:
+        test_forget_full = test_forget_full[:args.max_samples_per_split]
+        test_retain_full = test_retain_full[:args.max_samples_per_split]
+
+    test_forget = _shard_items(test_forget_full, shard_idx, num_shards)
+    test_retain = _shard_items(test_retain_full, shard_idx, num_shards)
+
+    logger.info("[%s] Shard %d/%d — forget: %d items, retain: %d items",
+                model_tag, shard_idx, num_shards,
+                len(test_forget), len(test_retain))
+
+    # Resolve forget classes (from full data, not shard)
+    forget_classes = _resolve_forget_classes(args, test_forget_full)
+
+    # Sanity check on shard data
+    _sanity_check_images(
+        [("test_forget", test_forget[:3]), ("test_retain", test_retain[:3])],
+        args.image_root,
+    )
+
+    # Load model
+    batch_size = args.batch_size
+    logger.info("[%s] Loading model on GPU %s (batch_size=%d)",
+                model_tag, gpu_ids, batch_size)
+    model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
+    logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
+
+    all_results: list[dict] = []
+
+    _kw = dict(
+        image_root=args.image_root,
+        max_samples=None,  # already applied above
+        forget_classes=forget_classes,
+        batch_size=batch_size,
+        model_tag=model_tag,
+    )
+
+    # ── BASELINE_NORMAL ────────────────────────────────────────────
+    logger.info("[%s] ═══ BASELINE_NORMAL ═══", model_tag)
+    cond_t0 = time.time()
+    all_results.extend(process_split(
+        model, processor, test_forget, "test_forget", "BASELINE_NORMAL", **_kw,
+    ))
+    baseline_retain_results = process_split(
+        model, processor, test_retain, "test_retain", "BASELINE_NORMAL", **_kw,
+    )
+    all_results.extend(baseline_retain_results)
+    logger.info("[%s] ═══ BASELINE_NORMAL done (%.0fs) ═══",
+                model_tag, time.time() - cond_t0)
+
+    # ── Extra conditions ───────────────────────────────────────────
+    for cond in extra_conditions:
+        logger.info("[%s] ═══ %s ═══", model_tag, cond)
+        cond_t0 = time.time()
+
+        all_results.extend(process_split(
+            model, processor, test_forget, "test_forget", cond, **_kw,
+        ))
+        if cond in SYSTEM_CONDITIONS:
+            all_results.extend(process_split(
+                model, processor, test_retain, "test_retain", cond, **_kw,
+            ))
+        else:
+            for r in baseline_retain_results:
+                copy = dict(r)
+                copy["condition"] = cond
+                all_results.append(copy)
+
+        logger.info("[%s] ═══ %s done (%.0fs) ═══",
+                    model_tag, cond, time.time() - cond_t0)
+
+    # ── Optional train splits ──────────────────────────────────────
+    if args.train_forget_jsonl:
+        train_forget_full = _load_jsonl(args.train_forget_jsonl)
+        if args.max_samples_per_split:
+            train_forget_full = train_forget_full[:args.max_samples_per_split]
+        train_forget = _shard_items(train_forget_full, shard_idx, num_shards)
+        logger.info("[%s] Train-forget shard: %d items", model_tag, len(train_forget))
+        all_results.extend(process_split(
+            model, processor, train_forget, "train_forget", "BASELINE_NORMAL", **_kw,
+        ))
+        for cond in extra_conditions:
+            all_results.extend(process_split(
+                model, processor, train_forget, "train_forget", cond, **_kw,
+            ))
+
+    if args.train_retain_jsonl:
+        train_retain_full = _load_jsonl(args.train_retain_jsonl)
+        if args.max_samples_per_split:
+            train_retain_full = train_retain_full[:args.max_samples_per_split]
+        train_retain = _shard_items(train_retain_full, shard_idx, num_shards)
+        logger.info("[%s] Train-retain shard: %d items", model_tag, len(train_retain))
+        tr_retain_baseline = process_split(
+            model, processor, train_retain, "train_retain", "BASELINE_NORMAL", **_kw,
+        )
+        all_results.extend(tr_retain_baseline)
+        for cond in extra_conditions:
+            if cond in SYSTEM_CONDITIONS:
+                all_results.extend(process_split(
+                    model, processor, train_retain, "train_retain", cond, **_kw,
+                ))
+            else:
+                for r in tr_retain_baseline:
+                    copy = dict(r)
+                    copy["condition"] = cond
+                    all_results.append(copy)
+
+    # ── Write shard results ────────────────────────────────────────
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(out / "results.jsonl", all_results)
+    logger.info("[%s] Shard %d done — wrote %d results to %s",
+                model_tag, shard_idx, len(all_results), out / "results.jsonl")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Main: coordinator (single-process) or MapReduce dispatcher
+# ══════════════════════════════════════════════════════════════════════
 
 def main():
     logging.basicConfig(
@@ -863,7 +1122,7 @@ def main():
     )
     parser.add_argument("--out_dir", required=True)
 
-    # ── GPU & batch arguments ──────────────────────────────────────
+    # ── GPU & batch & parallelism ──────────────────────────────────
     parser.add_argument(
         "--gpu_ids", default=None,
         help="Comma-separated GPU device indices (e.g. '0' or '0,1'). "
@@ -871,30 +1130,138 @@ def main():
     )
     parser.add_argument(
         "--batch_size", type=int, default=8,
-        help="Batch size for inference (default: 8). "
-             "Set to 1 for single-sample inference.",
+        help="Batch size for inference (default: 8).",
     )
+    parser.add_argument(
+        "--num_workers", type=int, default=1,
+        help="Number of data-parallel workers. Each worker loads the model "
+             "on a separate GPU and processes 1/N of the data. "
+             "Set to 8 for 8×B200 with a small model. Default: 1.",
+    )
+
+    # ── Internal worker flags (not for user) ───────────────────────
+    parser.add_argument("--_worker", action="store_true", default=False,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--_shard_idx", type=int, default=0,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--_num_shards", type=int, default=1,
+                        help=argparse.SUPPRESS)
+
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    # ── Worker mode ────────────────────────────────────────────────
+    if args._worker:
+        _run_as_worker(args)
+        return
 
-    # ── Parse GPU ids ──────────────────────────────────────────────
-    gpu_ids = None
+    # ── MapReduce mode (num_workers > 1) ───────────────────────────
+    if args.num_workers > 1:
+        _run_mapreduce(args)
+        return
+
+    # ── Single-process mode (original path) ────────────────────────
+    _run_single_process(args)
+
+
+def _run_mapreduce(args):
+    """Coordinator: spawn N workers, wait, then reduce."""
+    num_workers = args.num_workers
+    model_tag = args.model_name.split("/")[-1]
+
+    # Determine which GPUs to use
     if args.gpu_ids is not None:
-        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+        available_gpus = [int(x.strip()) for x in args.gpu_ids.split(",")]
+    elif "CUDA_VISIBLE_DEVICES" in os.environ:
+        cvd = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        available_gpus = [int(x.strip()) for x in cvd]
+    else:
+        available_gpus = list(range(torch.cuda.device_count()))
 
-    # ── Resolve which conditions to run ────────────────────────────
+    if len(available_gpus) < num_workers:
+        logger.warning("Requested %d workers but only %d GPUs available. "
+                        "Using %d workers.",
+                        num_workers, len(available_gpus), len(available_gpus))
+        num_workers = len(available_gpus)
+
+    # Resolve forget classes (for reduce step)
+    test_forget_full = _load_jsonl(args.test_forget_jsonl)
+    forget_classes = _resolve_forget_classes(args, test_forget_full)
+
     if args.run_all:
         args.run_oracle_hard = True
         args.run_oracle_reverse = True
         args.run_unlearn_soft = True
         args.run_unlearn_medium = True
 
-    # Conditions whose prompts are per-item (GT-dependent): only affect
-    # the forget split; retain reuses baseline results.
+    run_conditions = ["BASELINE_NORMAL"]
+    if args.run_unlearn_soft:
+        run_conditions.append("UNLEARN_SOFT")
+    if args.run_unlearn_medium:
+        run_conditions.append("UNLEARN_MEDIUM")
+    if args.run_oracle_hard:
+        run_conditions.append("ORACLE_HARD")
+    if args.run_oracle_reverse:
+        run_conditions.append("ORACLE_REVERSE")
+
+    shard_base = os.path.join(args.out_dir, "_shards")
+
+    logger.info("[%s] MapReduce: %d workers on GPUs %s",
+                model_tag, num_workers, available_gpus[:num_workers])
+    logger.info("[%s] Conditions: %s", model_tag, run_conditions)
+
+    # ── MAP: spawn workers ─────────────────────────────────────────
+    t0 = time.time()
+    procs = []
+    for i in range(num_workers):
+        gpu_id = available_gpus[i]
+        shard_dir = os.path.join(shard_base, f"shard_{i}")
+        proc, log_file = _run_worker_subprocess(args, i, num_workers, gpu_id, shard_dir)
+        procs.append((proc, i, gpu_id, log_file))
+
+    # ── Wait for all workers ───────────────────────────────────────
+    all_ok = True
+    for proc, idx, gpu_id, log_file in procs:
+        proc.wait()
+        if proc.returncode != 0:
+            logger.error("Worker %d (GPU %d) FAILED (exit code %d). Log: %s",
+                          idx, gpu_id, proc.returncode, log_file)
+            all_ok = False
+        else:
+            logger.info("Worker %d (GPU %d) completed successfully.", idx, gpu_id)
+
+    map_time = time.time() - t0
+    logger.info("[%s] All workers finished in %.0fs", model_tag, map_time)
+
+    if not all_ok:
+        logger.error("Some workers failed. Check logs in %s", shard_base)
+        # Still try to reduce whatever succeeded
+
+    # ── REDUCE: merge shard results ────────────────────────────────
+    metrics = _reduce_shards(
+        shard_base, num_workers, args.out_dir, forget_classes, run_conditions,
+    )
+
+    _print_summary(metrics, args.model_name, run_conditions)
+    logger.info("[%s] MapReduce complete. Results in %s", model_tag, args.out_dir)
+
+
+def _run_single_process(args):
+    """Original single-process execution path."""
+    torch.manual_seed(args.seed)
+
+    # Parse GPU ids
+    gpu_ids = None
+    if args.gpu_ids is not None:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+
+    # Resolve conditions
+    if args.run_all:
+        args.run_oracle_hard = True
+        args.run_oracle_reverse = True
+        args.run_unlearn_soft = True
+        args.run_unlearn_medium = True
+
     PER_ITEM_CONDITIONS = {"ORACLE_HARD", "ORACLE_REVERSE"}
-    # Conditions whose prompts are system-level (class-list): affect BOTH
-    # forget and retain (to measure collateral damage).
     SYSTEM_CONDITIONS = {"UNLEARN_SOFT", "UNLEARN_MEDIUM"}
 
     extra_conditions: list[str] = []
@@ -907,27 +1274,27 @@ def main():
     if args.run_oracle_reverse:
         extra_conditions.append("ORACLE_REVERSE")
 
-    # ── Short model tag for log lines ─────────────────────────────
     model_tag = args.model_name.split("/")[-1]
 
-    # ── Load splits ────────────────────────────────────────────────
+    # Load splits
     test_forget = _load_jsonl(args.test_forget_jsonl)
     test_retain = _load_jsonl(args.test_retain_jsonl)
     logger.info("[%s] Test forget: %d items, Test retain: %d items",
                 model_tag, len(test_forget), len(test_retain))
 
-    # ── Resolve forget classes ─────────────────────────────────────
+    # Resolve forget classes
     forget_classes = _resolve_forget_classes(args, test_forget)
     logger.info("[%s] Forget classes (K=%d): %s",
                 model_tag, len(forget_classes), forget_classes)
 
-    # ── Early sanity check ─────────────────────────────────────────
+    # Sanity check
     _sanity_check_images(
         [("test_forget", test_forget), ("test_retain", test_retain)],
         args.image_root,
     )
 
-    # ── Load model ─────────────────────────────────────────────────
+    # Load model
+    batch_size = args.batch_size
     logger.info("[%s] Loading model: %s (GPUs: %s, batch_size: %d)",
                 model_tag, args.model_name, gpu_ids or "auto", batch_size)
     model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
@@ -938,16 +1305,14 @@ def main():
         logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
 
     all_results: list[dict] = []
-    batch_size = args.batch_size
 
-    # ── Clear previous results file (fresh run) ───────────────────
+    # Clear previous results file
     out_path = Path(args.out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     results_file = out_path / "results.jsonl"
     if results_file.exists():
         results_file.unlink()
 
-    # ── Common kwargs ─────────────────────────────────────────────
     _kw = dict(
         image_root=args.image_root,
         max_samples=args.max_samples_per_split,
@@ -972,23 +1337,19 @@ def main():
     metrics = _save_incremental(
         args.out_dir, all_results, forget_classes, "BASELINE_NORMAL")
 
-    # ── Helper: run a condition on test splits ─────────────────────
+    # ── Helper: run extra condition ────────────────────────────────
     def _run_condition(cond):
         logger.info("[%s] ═══ Starting condition: %s ═══", model_tag, cond)
         cond_t0 = time.time()
 
-        # Forget split — always runs fresh inference
         all_results.extend(process_split(
             model, processor, test_forget, "test_forget", cond, **_kw,
         ))
-        # Retain split
         if cond in SYSTEM_CONDITIONS:
-            # System-level prompt affects retain too → fresh inference
             all_results.extend(process_split(
                 model, processor, test_retain, "test_retain", cond, **_kw,
             ))
         else:
-            # Per-item conditions: retain prompt == baseline → reuse
             for r in baseline_retain_results:
                 copy = dict(r)
                 copy["condition"] = cond
@@ -999,7 +1360,6 @@ def main():
         return _save_incremental(
             args.out_dir, all_results, forget_classes, cond)
 
-    # ── Extra conditions ───────────────────────────────────────────
     for cond in extra_conditions:
         metrics = _run_condition(cond)
 
