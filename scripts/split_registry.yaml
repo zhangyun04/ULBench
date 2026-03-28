@@ -24,10 +24,10 @@
 # =============================================================================
 
 defaults:
-  n_train_per_forget_class: 100
-  n_test_per_forget_class: 100
-  n_retain_train: 2000
-  n_retain_test: 500
+  n_train_per_forget_class: 10 #default is 100
+  n_test_per_forget_class: 10 #default is 100
+  n_retain_train: 200 #default is 2000
+  n_retain_test: 100 #default is 500
   seed: 42
 
 datasets:
@@ -40,10 +40,10 @@ datasets:
     experiments:
       - name: coco_rk10_s42
         mode: random_k
-        k: 10
+        k: 1
       - name: coco_sbk10_s42
         mode: superclass_balanced_k
-        k: 10
+        k: 1
 
   # ── AID (30 aerial scene classes, ~200-400 images/class) ─────────────
   aid:

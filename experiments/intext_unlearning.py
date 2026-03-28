@@ -238,6 +238,9 @@ def load_model_and_processor(model_name, gpu_ids=None):
     import transformers
 
     processor = AutoProcessor.from_pretrained(model_name)
+    # Decoder-only models require left-padding for correct batched generation.
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer.padding_side = "left"
 
     cls = getattr(transformers, "AutoModelForImageTextToText", None)
     if cls is None:
