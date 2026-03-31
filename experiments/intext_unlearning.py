@@ -220,6 +220,230 @@ def parse_answer(raw_output):
     return int(match.group(1)) if match else None
 
 
+# ── Logit-based evaluation helpers ────────────────────────────────────
+
+def is_thinking_model(model_name: str) -> bool:
+    """Return True for models that support chain-of-thought thinking."""
+    return "thinking" in model_name.lower()
+
+
+def get_answer_token_ids(processor) -> dict:
+    """Return {0: [token_ids], 1: [token_ids], 2: [token_ids], 3: [token_ids]}.
+
+    Collects all token IDs whose decoded text is exactly the digit string.
+    Falls back to the first token of encode(str(idx)) if none match.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    ids: dict[int, list[int]] = {}
+    for idx in range(4):
+        digit = str(idx)
+        candidates: set[int] = set()
+        for text in (digit, f" {digit}", f"\u2581{digit}"):   # bare, space-prefixed, SentencePiece ▁
+            try:
+                toks = tokenizer.encode(text, add_special_tokens=False)
+            except Exception:
+                continue
+            for t in toks:
+                try:
+                    decoded = tokenizer.decode([t]).strip()
+                    if decoded == digit:
+                        candidates.add(t)
+                except Exception:
+                    pass
+        if not candidates:
+            try:
+                toks = tokenizer.encode(digit, add_special_tokens=False)
+                if toks:
+                    candidates.add(toks[0])
+            except Exception:
+                pass
+        ids[idx] = list(candidates) if candidates else [idx]   # last-resort: raw idx
+    return ids
+
+
+def _logit_pick(logits_1d, answer_token_ids: dict) -> int:
+    """Return the answer index (0-3) with the highest logit."""
+    best_ans, best_val = 0, float("-inf")
+    for ans_idx, token_ids in answer_token_ids.items():
+        for tid in token_ids:
+            try:
+                v = logits_1d[tid].item()
+            except IndexError:
+                continue
+            if v > best_val:
+                best_val = v
+                best_ans = ans_idx
+    return best_ans
+
+
+def _get_first_device(model):
+    """Return the primary device of the model as a torch.device-compatible string."""
+    if hasattr(model, "hf_device_map"):
+        first = next(iter(model.hf_device_map.values()))
+        if isinstance(first, int):
+            return f"cuda:{first}"
+        if isinstance(first, str):
+            return first
+    try:
+        d = model.device
+        if str(d) != "meta":
+            return d
+    except Exception:
+        pass
+    return "cuda:0"
+
+
+def run_logit_batch(model, processor, prompt_texts, image_paths, answer_token_ids):
+    """Forward pass (no generation) for non-thinking models.
+
+    Returns a list of predicted answer indices (0-3), one per input.
+    None means inference failed for that item.
+    """
+    images, texts, valid_indices = [], [], []
+    for idx, (prompt, img_path) in enumerate(zip(prompt_texts, image_paths)):
+        try:
+            img = Image.open(img_path).convert("RGB")
+            messages = [{"role": "user", "content": [
+                {"type": "image"}, {"type": "text", "text": prompt}]}]
+            text = _apply_chat_template(processor, messages)
+            images.append(img)
+            texts.append(text)
+            valid_indices.append(idx)
+        except Exception as exc:
+            logger.warning("Failed to prepare item %d for logit eval: %s", idx, exc)
+
+    results = [None] * len(prompt_texts)
+    if not valid_indices:
+        return results
+
+    device = _get_first_device(model)
+
+    try:
+        inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
+        inputs = inputs.to(device)
+        with torch.no_grad():
+            out = model(**inputs)
+        last_logits = out.logits[:, -1, :]          # (batch, vocab)
+        for bi, vi in enumerate(valid_indices):
+            results[vi] = _logit_pick(last_logits[bi], answer_token_ids)
+    except Exception as exc:
+        logger.warning("Logit batch forward failed, falling back to single: %s", exc)
+        for bi, vi in enumerate(valid_indices):
+            try:
+                inp1 = processor(text=[texts[bi]], images=[images[bi]],
+                                 return_tensors="pt", padding=True).to(device)
+                with torch.no_grad():
+                    out1 = model(**inp1)
+                results[vi] = _logit_pick(out1.logits[0, -1, :], answer_token_ids)
+            except Exception as exc2:
+                logger.warning("Single logit fallback failed item %d: %s", vi, exc2)
+
+    return results
+
+
+def run_logit_thinking(model, processor, prompt_text, image_path, answer_token_ids,
+                       thinking_tokens: int = 32):
+    """For thinking models: generate thinking tokens, then take logit for answer.
+
+    Strategy:
+      1. Build input with thinking enabled.
+      2. Generate up to *thinking_tokens* tokens (chain-of-thought).
+      3. Forward full sequence (input + thinking) through the model.
+      4. Pick answer from logits of the last token.
+    """
+    img = Image.open(image_path).convert("RGB")
+    messages = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": prompt_text}]}]
+
+    # Enable thinking for the prompt (don't suppress it)
+    try:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+    except TypeError:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+
+    inputs = processor(text=[text], images=[img], return_tensors="pt", padding=True)
+    device = _get_first_device(model)
+    inputs = inputs.to(device)
+
+    with torch.no_grad():
+        # Step 1: generate thinking tokens
+        output_ids = model.generate(
+            **inputs, max_new_tokens=thinking_tokens, do_sample=False)
+
+        # Step 2: forward pass on full sequence (input_ids + thinking_ids)
+        # Keep all visual inputs (pixel_values, etc.) from original inputs
+        fwd_kwargs = {k: v for k, v in inputs.items()
+                      if k not in ("input_ids", "attention_mask")}
+        fwd_kwargs["input_ids"] = output_ids
+        fwd_kwargs["attention_mask"] = torch.ones_like(output_ids)
+        out = model(**fwd_kwargs)
+
+    return _logit_pick(out.logits[0, -1, :], answer_token_ids)
+
+
+# ── InternVL3 native inference (model.chat() path) ─────────────────────
+
+def _internvl_image_transform(input_size=448):
+    """Standard InternVL image preprocessing transform."""
+    import torchvision.transforms as T
+    from torchvision.transforms.functional import InterpolationMode
+    return T.Compose([
+        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+
+_INTERNVL_TRANSFORM = None  # lazy-init
+
+
+def run_internvl_batch(model, processor, prompt_texts, image_paths):
+    """InternVL3 inference using model.chat() (generate+parse fallback).
+
+    *processor* is the bare tokenizer (Qwen2TokenizerFast).
+    Returns list of raw output strings, one per item.
+    """
+    global _INTERNVL_TRANSFORM
+    if _INTERNVL_TRANSFORM is None:
+        _INTERNVL_TRANSFORM = _internvl_image_transform()
+
+    # processor IS the tokenizer for InternVL
+    tokenizer = processor if not hasattr(processor, "tokenizer") else processor.tokenizer
+    generation_config = dict(max_new_tokens=16, do_sample=False)
+    device = _get_first_device(model)
+
+    if not callable(getattr(model, "chat", None)):
+        logger.warning("Model has no .chat() method — InternVL inference not supported.")
+        return [""] * len(prompt_texts)
+
+    results = []
+    for prompt, img_path in zip(prompt_texts, image_paths):
+        try:
+            img = Image.open(img_path).convert("RGB")
+            pixel_values = _INTERNVL_TRANSFORM(img).unsqueeze(0).to(
+                device, dtype=torch.bfloat16)
+            response = model.chat(tokenizer, pixel_values, prompt, generation_config)
+            if isinstance(response, tuple):
+                response = response[0]
+            results.append(str(response))
+        except Exception as exc:
+            logger.warning("InternVL chat failed: %s", exc)
+            results.append("")
+    return results
+
+
+def processor_has_image_support(processor) -> bool:
+    """Return True if the processor can handle images via __call__(images=...)."""
+    return (
+        hasattr(processor, "image_processor")
+        or hasattr(processor, "feature_extractor")
+        or hasattr(processor, "image_mean")
+    )
+
+
 # ── Model loading ──────────────────────────────────────────────────────
 
 def load_model_and_processor(model_name, gpu_ids=None):
@@ -237,16 +461,81 @@ def load_model_and_processor(model_name, gpu_ids=None):
     from transformers import AutoProcessor
     import transformers
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    # Load processor — try multiple strategies to get one with image support.
+    def _has_image_support(proc):
+        return (hasattr(proc, "image_processor")
+                or hasattr(proc, "feature_extractor")
+                or hasattr(proc, "image_mean"))  # CLIPProcessor etc.
+
+    processor = None
+    # 1) AutoProcessor with trc=True then False
+    for trc in (True, False):
+        try:
+            proc = AutoProcessor.from_pretrained(model_name, trust_remote_code=trc)
+            if processor is None:
+                processor = proc  # keep as fallback even if bare tokenizer
+            if _has_image_support(proc):
+                processor = proc
+                logger.info("Loaded processor via AutoProcessor (trc=%s): %s",
+                            trc, type(processor).__name__)
+                break
+        except Exception as exc:
+            logger.debug("AutoProcessor trc=%s failed: %s", trc, exc)
+
+    # 2) If still no image support, try known native multimodal processor classes.
+    #    Exclude bare CLIPProcessor — it has image_processor but no chat template
+    #    and is incompatible with the VQA prompt pipeline.
+    if processor is None or not _has_image_support(processor):
+        _native_proc_classes = []
+        for cls_name in ("InternVLProcessor", "Phi4MultimodalProcessor",
+                         "MiniCPMProcessor"):
+            cls = getattr(transformers, cls_name, None)
+            if cls is not None:
+                _native_proc_classes.append(cls)
+        for cls in _native_proc_classes:
+            for trc in (True, False):
+                try:
+                    proc = cls.from_pretrained(model_name, trust_remote_code=trc)
+                    # Require both image support AND a usable tokenizer/chat template
+                    has_tok = hasattr(proc, "tokenizer") or hasattr(proc, "encode")
+                    if _has_image_support(proc) and has_tok:
+                        processor = proc
+                        logger.info("Loaded processor via %s (trc=%s): %s",
+                                    cls.__name__, trc, type(processor).__name__)
+                        break
+                except Exception as exc:
+                    logger.debug("%s trc=%s failed: %s", cls.__name__, trc, exc)
+            if processor is not None and _has_image_support(processor):
+                break
+
+    if processor is None:
+        raise RuntimeError(f"Could not load any processor for {model_name}")
+
+    # If we ended up with a bare tokenizer (no image support), note it — the
+    # inference code will use model.chat() / model.generate() directly.
+    if not _has_image_support(processor):
+        logger.warning(
+            "Processor for %s has no image support (%s). "
+            "Will use model-native chat() inference.",
+            model_name, type(processor).__name__,
+        )
+
     # Decoder-only models require left-padding for correct batched generation.
     if hasattr(processor, "tokenizer"):
         processor.tokenizer.padding_side = "left"
 
-    cls = getattr(transformers, "AutoModelForImageTextToText", None)
-    if cls is None:
-        cls = getattr(transformers, "AutoModelForVision2Seq", None)
-    if cls is None:
-        raise RuntimeError("No VL auto-class found in transformers")
+    # Auto-class candidates: try task-specific first, fall back to AutoModel.
+    # Try trust_remote_code=False first so native registered configs (Phi4MultimodalConfig,
+    # InternVLConfig, etc.) are used before hub custom ones that may not be registered.
+    auto_classes = []
+    for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq", "AutoModel"):
+        c = getattr(transformers, name, None)
+        if c is not None:
+            auto_classes.append(c)
+    if not auto_classes:
+        raise RuntimeError("No auto model class found in transformers")
+
+    trust_remote_codes = (False, True)  # native first, hub custom as fallback
 
     # Determine loading strategy based on gpu_ids
     if gpu_ids is not None and len(gpu_ids) == 1:
@@ -254,20 +543,24 @@ def load_model_and_processor(model_name, gpu_ids=None):
         device = f"cuda:{gpu_ids[0]}"
         logger.info("Loading model on single device: %s", device)
         last_exc = None
-        for dtype_key in ("torch_dtype", "dtype"):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    model = cls.from_pretrained(
-                        model_name, **{dtype_key: torch.bfloat16},
-                    )
-                model = model.to(device)
-                model.eval()
-                logger.info("Loaded model via %s on %s", cls.__name__, device)
-                return model, processor
-            except Exception as exc:
-                last_exc = exc
-                continue
+        for cls in auto_classes:
+            for dtype_key in ("torch_dtype", "dtype"):
+                for trc in trust_remote_codes:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", FutureWarning)
+                            model = cls.from_pretrained(
+                                model_name, **{dtype_key: torch.bfloat16},
+                                trust_remote_code=trc,
+                            )
+                        model = model.to(device)
+                        model.eval()
+                        logger.info("Loaded model via %s (trc=%s) on %s",
+                                    cls.__name__, trc, device)
+                        return model, processor
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
         raise RuntimeError(f"Could not load {model_name} on {device}: {last_exc}")
     else:
         # Multi-GPU or auto: use device_map with optional max_memory
@@ -281,21 +574,23 @@ def load_model_and_processor(model_name, gpu_ids=None):
             logger.info("Loading model with device_map='auto' (all visible GPUs)")
 
         last_exc = None
-        for dtype_key in ("torch_dtype", "dtype"):
-            kwargs = {dtype_key: torch.bfloat16, "device_map": "auto"}
-            if max_memory is not None:
-                kwargs["max_memory"] = max_memory
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    model = cls.from_pretrained(model_name, **kwargs)
-                logger.info("Loaded model via %s with %s", cls.__name__, list(kwargs))
-                model.eval()
-                return model, processor
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Load attempt failed (%s): %s", kwargs, exc)
-                continue
+        for cls in auto_classes:
+            for dtype_key in ("torch_dtype", "dtype"):
+                for trc in trust_remote_codes:
+                    kwargs = {dtype_key: torch.bfloat16, "device_map": "auto",
+                              "trust_remote_code": trc}
+                    if max_memory is not None:
+                        kwargs["max_memory"] = max_memory
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", FutureWarning)
+                            model = cls.from_pretrained(model_name, **kwargs)
+                        logger.info("Loaded model via %s (trc=%s)", cls.__name__, trc)
+                        model.eval()
+                        return model, processor
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
 
         raise RuntimeError(f"Could not load {model_name}: {last_exc}")
 
@@ -430,12 +725,24 @@ def run_batch_inference(model, processor, prompt_texts, image_paths):
 
 def process_split(model, processor, items, split_name, condition,
                   image_root, max_samples=None, forget_classes=None,
-                  batch_size=1, model_tag=""):
+                  batch_size=1, model_tag="",
+                  answer_token_ids=None, is_thinking=False):
     """Run inference on *items* under *condition* and return result dicts.
+
+    When *answer_token_ids* is provided, logit-based evaluation is used:
+      - Non-thinking models: batch forward pass, argmax over answer token logits.
+      - Thinking models: per-item generate-128-then-forward strategy.
+    Otherwise falls back to generate+parse (legacy, kept for compatibility).
 
     When batch_size > 1, items are processed in batches for higher throughput.
     *model_tag* is a short identifier shown in log lines for multi-GPU runs.
     """
+    use_logit = answer_token_ids is not None
+    # If the processor doesn't support images, fall back to InternVL-style
+    # model.chat() generate+parse regardless of logit setting.
+    if use_logit and not processor_has_image_support(processor):
+        use_logit = False
+        logger.info("Processor has no image support — using model.chat() generate+parse.")
     is_forget = "forget" in split_name
     results = []
 
@@ -446,8 +753,121 @@ def process_split(model, processor, items, split_name, condition,
     tag = f"[{model_tag}] " if model_tag else ""
     t_start = time.time()
 
-    if batch_size <= 1:
-        # ── Single-item inference (original path) ────────────────────
+    if use_logit and is_thinking:
+        # ── Thinking model: per-item generate-then-forward ──────────
+        for idx, item in enumerate(items):
+            prompt = build_prompt(item, condition, is_forget, forget_classes)
+            abs_path = _resolve_image_path(item, image_root)
+            gt = item["answer_index"]
+            meta = item.get("meta", {})
+
+            pred = None
+            error = None
+            if not os.path.exists(abs_path):
+                error = f"image_not_found: {abs_path}"
+            else:
+                try:
+                    pred = run_logit_thinking(
+                        model, processor, prompt, abs_path, answer_token_ids)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    logger.warning("Thinking logit error on %s: %s", item["id"], error)
+
+            results.append({
+                "id": item["id"],
+                "split": split_name,
+                "condition": condition,
+                "gt_index": gt,
+                "pred_index": pred,
+                "is_correct": pred == gt if pred is not None else False,
+                "is_invalid": pred is None,
+                "error": error,
+                "raw_output": f"logit_thinking:{pred}" if pred is not None else "",
+                "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                "meta_superclass": meta.get("superclass", "unknown"),
+                "abs_image_path": abs_path,
+            })
+
+            if (idx + 1) % 10 == 0 or idx == total - 1:
+                n_inv = sum(1 for r in results if r["is_invalid"])
+                elapsed = time.time() - t_start
+                speed = (idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (total - idx - 1) / speed if speed > 0 else 0
+                logger.info(
+                    "%s%s / %s  %d/%d  (invalid=%d  %.2f it/s  ETA %.0fs)",
+                    tag, split_name, condition, idx + 1, total,
+                    n_inv, speed, eta,
+                )
+
+    elif use_logit and not is_thinking:
+        # ── Non-thinking model: batched logit forward pass ───────────
+        for batch_start in range(0, total, batch_size):
+            batch_items = items[batch_start : batch_start + batch_size]
+            prompts, abs_paths, errors_pre = [], [], []
+
+            for item in batch_items:
+                prompt = build_prompt(item, condition, is_forget, forget_classes)
+                abs_path = _resolve_image_path(item, image_root)
+                prompts.append(prompt)
+                abs_paths.append(abs_path)
+                errors_pre.append(
+                    f"image_not_found: {abs_path}" if not os.path.exists(abs_path) else None)
+
+            valid_prompts, valid_paths, valid_batch_indices = [], [], []
+            for i, err in enumerate(errors_pre):
+                if err is None:
+                    valid_prompts.append(prompts[i])
+                    valid_paths.append(abs_paths[i])
+                    valid_batch_indices.append(i)
+
+            preds_valid = run_logit_batch(
+                model, processor, valid_prompts, valid_paths, answer_token_ids,
+            ) if valid_prompts else []
+
+            valid_iter = iter(range(len(valid_batch_indices)))
+            for i, item in enumerate(batch_items):
+                meta = item.get("meta", {})
+                gt = item["answer_index"]
+
+                if errors_pre[i] is not None:
+                    results.append({
+                        "id": item["id"], "split": split_name, "condition": condition,
+                        "gt_index": gt, "pred_index": None,
+                        "is_correct": False, "is_invalid": True,
+                        "error": errors_pre[i], "raw_output": "",
+                        "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                        "meta_superclass": meta.get("superclass", "unknown"),
+                        "abs_image_path": abs_paths[i],
+                    })
+                else:
+                    vi = next(valid_iter)
+                    pred = preds_valid[vi] if vi < len(preds_valid) else None
+                    error = None if pred is not None else "logit_inference_failed"
+                    results.append({
+                        "id": item["id"], "split": split_name, "condition": condition,
+                        "gt_index": gt, "pred_index": pred,
+                        "is_correct": pred == gt if pred is not None else False,
+                        "is_invalid": pred is None,
+                        "error": error,
+                        "raw_output": f"logit:{pred}" if pred is not None else "",
+                        "meta_synset": meta.get("forget_concept", meta.get("synset", meta.get("class_name", ""))),
+                        "meta_superclass": meta.get("superclass", "unknown"),
+                        "abs_image_path": abs_paths[i],
+                    })
+
+            processed = min(batch_start + batch_size, total)
+            n_inv = sum(1 for r in results if r["is_invalid"])
+            elapsed = time.time() - t_start
+            speed = processed / elapsed if elapsed > 0 else 0
+            eta = (total - processed) / speed if speed > 0 else 0
+            logger.info(
+                "%s%s / %s  %d/%d  (invalid=%d  %.2f it/s  ETA %.0fs)",
+                tag, split_name, condition, processed, total,
+                n_inv, speed, eta,
+            )
+
+    elif batch_size <= 1:
+        # ── Legacy single-item generate+parse ────────────────────────
         for idx, item in enumerate(items):
             prompt = build_prompt(item, condition, is_forget, forget_classes)
             abs_path = _resolve_image_path(item, image_root)
@@ -498,7 +918,7 @@ def process_split(model, processor, items, split_name, condition,
                     n_inv, speed, eta,
                 )
     else:
-        # ── Batch inference ──────────────────────────────────────────
+        # ── Legacy batch generate+parse ──────────────────────────────
         for batch_start in range(0, total, batch_size):
             batch_items = items[batch_start : batch_start + batch_size]
 
@@ -531,9 +951,14 @@ def process_split(model, processor, items, split_name, condition,
             errors_infer = [None] * len(valid_prompts)
             if valid_prompts:
                 try:
-                    raw_outputs_valid = run_batch_inference(
-                        model, processor, valid_prompts, valid_paths,
-                    )
+                    if not processor_has_image_support(processor):
+                        raw_outputs_valid = run_internvl_batch(
+                            model, processor, valid_prompts, valid_paths,
+                        )
+                    else:
+                        raw_outputs_valid = run_batch_inference(
+                            model, processor, valid_prompts, valid_paths,
+                        )
                 except Exception as exc:
                     logger.warning("Batch inference error: %s", exc)
                     raw_outputs_valid = [""] * len(valid_prompts)
@@ -804,6 +1229,53 @@ def _save_incremental(out_dir, all_results, forget_classes, condition_name):
     return metrics
 
 
+# ── Summary JSON (merged across all models and datasets) ──────────────
+
+def update_summary_json(results_dir):
+    """Scan all metrics.json files under *results_dir* and write summary.json.
+
+    Each entry is keyed by the experiment directory name
+    (e.g. 'coco_rk10_s42__Qwen_Qwen3-VL-2B-Instruct') and contains flat
+    scalar metrics plus provenance fields.  Non-scalar (dict/list) metric
+    values are included separately under a 'details' key.
+    """
+    results_dir = Path(results_dir)
+    summary: dict = {}
+
+    for metrics_file in sorted(results_dir.glob("*/metrics.json")):
+        dir_name = metrics_file.parent.name
+        # Skip shard sub-directories
+        if dir_name.startswith("shard_") or dir_name.startswith("_"):
+            continue
+        parts = dir_name.split("__", 1)
+        dataset_split = parts[0] if len(parts) >= 1 else dir_name
+        model = parts[1] if len(parts) == 2 else dir_name
+
+        try:
+            with metrics_file.open() as f:
+                metrics = json.load(f)
+            if not metrics:
+                continue
+            scalar_metrics = {k: v for k, v in metrics.items()
+                              if not isinstance(v, (dict, list))}
+            detail_metrics = {k: v for k, v in metrics.items()
+                              if isinstance(v, (dict, list))}
+            summary[dir_name] = {
+                "dataset_split": dataset_split,
+                "model": model,
+                **scalar_metrics,
+                "details": detail_metrics,
+            }
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", metrics_file, exc)
+
+    summary_file = results_dir / "summary.json"
+    with summary_file.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    logger.info("Updated summary.json: %d entries → %s", len(summary), summary_file)
+    return summary
+
+
 # ══════════════════════════════════════════════════════════════════════
 # MapReduce: data-parallel multi-GPU for a SINGLE model
 # ══════════════════════════════════════════════════════════════════════
@@ -826,7 +1298,7 @@ def _run_worker_subprocess(args, shard_idx, num_shards, gpu_id, shard_dir):
         "--image_root", args.image_root,
         "--model_name", args.model_name,
         "--seed", str(args.seed),
-        "--gpu_ids", str(gpu_id),
+        "--gpu_ids", "0",
         "--batch_size", str(args.batch_size),
         "--out_dir", shard_dir,
         "--_worker",
@@ -978,6 +1450,12 @@ def _run_as_worker(args):
     model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
     logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
 
+    # Logit-based eval setup
+    thinking = is_thinking_model(args.model_name)
+    answer_tids = get_answer_token_ids(processor)
+    logger.info("[%s] Logit eval: is_thinking=%s  answer_token_ids=%s",
+                model_tag, thinking, answer_tids)
+
     all_results: list[dict] = []
 
     _kw = dict(
@@ -986,6 +1464,8 @@ def _run_as_worker(args):
         forget_classes=forget_classes,
         batch_size=batch_size,
         model_tag=model_tag,
+        answer_token_ids=answer_tids,
+        is_thinking=thinking,
     )
 
     # ── BASELINE_NORMAL ────────────────────────────────────────────
@@ -1247,6 +1727,13 @@ def _run_mapreduce(args):
     _print_summary(metrics, args.model_name, run_conditions)
     logger.info("[%s] MapReduce complete. Results in %s", model_tag, args.out_dir)
 
+    # Update merged summary across all models/datasets
+    results_parent = str(Path(args.out_dir).parent)
+    try:
+        update_summary_json(results_parent)
+    except Exception as exc:
+        logger.warning("summary.json update failed: %s", exc)
+
 
 def _run_single_process(args):
     """Original single-process execution path."""
@@ -1307,6 +1794,12 @@ def _run_single_process(args):
     else:
         logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
 
+    # Logit-based eval setup
+    thinking = is_thinking_model(args.model_name)
+    answer_tids = get_answer_token_ids(processor)
+    logger.info("[%s] Logit eval: is_thinking=%s  answer_token_ids=%s",
+                model_tag, thinking, answer_tids)
+
     all_results: list[dict] = []
 
     # Clear previous results file
@@ -1322,6 +1815,8 @@ def _run_single_process(args):
         forget_classes=forget_classes,
         batch_size=batch_size,
         model_tag=model_tag,
+        answer_token_ids=answer_tids,
+        is_thinking=thinking,
     )
 
     # ── BASELINE_NORMAL (always) ───────────────────────────────────
@@ -1410,6 +1905,12 @@ def _run_single_process(args):
     run_conditions = ["BASELINE_NORMAL"] + extra_conditions
     _print_summary(metrics, args.model_name, run_conditions)
     logger.info("[%s] Done. Results in %s", model_tag, out_path)
+
+    # Update merged summary across all models/datasets
+    try:
+        update_summary_json(str(out_path.parent))
+    except Exception as exc:
+        logger.warning("summary.json update failed: %s", exc)
 
 
 if __name__ == "__main__":

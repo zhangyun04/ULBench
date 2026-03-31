@@ -1,0 +1,33 @@
+# 3-Day Evaluation Model List — Small dense models only (≤8B, no MoE/large)
+# Ordered smallest-first for maximum coverage within budget.
+# Fixes vs original:
+#   - InternVL3-5-*B → InternVL3-*B (correct HF IDs)
+#   - deepseek-vl2-* removed (deepseek_vl_v2 arch not in transformers 4.57.6)
+#   - trust_remote_code=True added in code for Phi-4, MiniCPM-o
+
+# ── Qwen3-VL small ────────────────────────────────────────────────────────────
+Qwen/Qwen3-VL-2B-Instruct         #small
+Qwen/Qwen3-VL-2B-Thinking         #small
+Qwen/Qwen3-VL-4B-Instruct         #small
+Qwen/Qwen3-VL-4B-Thinking         #small
+Qwen/Qwen3-VL-8B-Instruct         #small
+Qwen/Qwen3-VL-8B-Thinking         #small
+
+# ── InternVL3 small (correct IDs) ────────────────────────────────────────────
+OpenGVLab/InternVL3-1B             #small
+OpenGVLab/InternVL3-2B             #small
+OpenGVLab/InternVL3-8B             #small
+
+# ── Gemma 3 small ─────────────────────────────────────────────────────────────
+google/gemma-3-4b-it               #small
+
+# microsoft/Phi-4-multimodal-instruct  # skipped — persistent loading failures
+
+# ── LLaVA-OneVision 7B ────────────────────────────────────────────────────────
+llava-hf/llava-onevision-qwen2-7b-ov-hf    #small
+
+# ── MiniCPM-o 2.6 (needs trust_remote_code) ───────────────────────────────────
+openbmb/MiniCPM-o-2_6             #small
+
+# ── SmolVLM2 (needs num2words — now installed) ────────────────────────────────
+HuggingFaceTB/SmolVLM2-2.2B-Instruct   #small
