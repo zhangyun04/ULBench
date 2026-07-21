@@ -40,10 +40,10 @@ datasets:
     experiments:
       - name: coco_rk10_s42
         mode: random_k
-        k: 1
+        k: 10
       - name: coco_sbk10_s42
         mode: superclass_balanced_k
-        k: 1
+        k: 10
 
   # ── AID (30 aerial scene classes, ~200-400 images/class) ─────────────
   aid:

@@ -51,7 +51,13 @@ Multi-axis VQA benchmark generation for evaluating Vision-Language Model (VLM) u
 
 ### ImageNet / COCO
 
-These use HuggingFace or standard downloads — see original configs.
+COCO can be downloaded by `scripts/01_download_data.py`. ImageNet-1k is an
+optional, separately obtained source because access may be gated: place its
+HuggingFace parquet layout under `data/imagenet-1k/data/`, or change
+`dataset.hf_data_dir` in
+`vqa_gen/configs/imagenet_identity_mvp.yaml`. The checked-in ImageNet config is
+portable and uses global distractors; it does not claim semantic hard negatives
+while the superclass ontology is unavailable.
 
 ### SpatialMQA
 
@@ -138,6 +144,34 @@ Ensure COCO images are available at `data/coco`.
    ```
 
 ## Usage
+
+### 0. Validate or migrate benchmark metadata
+
+The normative v1 contract is in
+[`docs/benchmark_spec_v1.md`](docs/benchmark_spec_v1.md). Validate registry
+structure without requiring locally downloaded datasets with:
+
+```bash
+python -m ulbench.tools.validate registry scripts/split_registry.yaml \
+  --skip-path-check
+```
+
+For release validation, omit `--skip-path-check`. Legacy JSONL migration is
+explicit: dataset version, split, license, redistribution status, and
+provenance must be supplied rather than inferred silently.
+
+```bash
+python -m ulbench.tools.migrate_legacy_jsonl \
+  --input experiments/splits/example/test_forget.jsonl \
+  --output migrated/example_test_forget.jsonl \
+  --dataset-id example@v1 --source-version v1 \
+  --split test_forget \
+  --license-id unknown --redistribution index-only \
+  --provenance-note "Dataset provenance only; no pretraining claim."
+```
+
+Migration fails on rejected records or cross-record validation errors by
+default and writes a structured migration report beside the output.
 
 ### 1. Generate VQA Dataset
 

@@ -1,0 +1,20 @@
+dataset:
+  source_type: "hf_parquet"
+  # Download the ImageNet-1k parquet shards separately; the dataset is not
+  # included in scripts/01_download_data.py because access may be gated.
+  hf_data_dir: "data/imagenet-1k/data"
+  splits: ["train", "validation", "test"]
+
+paths:
+  output_root: "vqa_gen/output/output_imagenet"
+
+vqa_task:
+  question: "What object is shown in the image?"
+  concept_axis: "identity"
+  forgetting_level: "object"
+
+choices:
+  # The checked-in superclass ontology is not populated, so use three
+  # deterministic global negatives instead of pretending hard negatives exist.
+  hard_negatives: 0
+  easy_negatives: 3
