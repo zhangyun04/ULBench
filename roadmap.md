@@ -322,10 +322,10 @@ class UnlearningMethod:
 
 - `[x]` 把 `build_prompt()` 中 `UNLEARN_SOFT/MEDIUM` 迁到 `ulbench/methods/prompt_suppression.py`。（legacy 保留原实现直至 runner 落地；`tests/test_methods.py` 强制两侧 prompt 逐字一致）
 - `[x]` 把 `ORACLE_HARD/REVERSE` 迁到 `ulbench/audits/oracle_controls.py`，不再列入 unlearning methods 主表。（不继承 `UnlearningMethod`，类型层面无法注册为 method）
-- `[ ]` runner 只接受 `model_adapter + method_adapter + probe_suite + metric_suite`。
+- `[x]` runner 只接受 `model_adapter + method_adapter + probe_suite + metric_suite`。（`ulbench/runner.py`：capability 门控→渲染→method hooks→scorer→spec §5.2 全套 artifacts（manifest/results/metrics/failures/logs）；GPU 验证 no_op 与 prompt_suppression 零改动互换）
 - `[x]` method 声明需要的能力：I/O、logits、hidden states、gradients、weight write、retain set。（`MethodSpec.required_capabilities` + `UnlearningMethod.validate_against`）
-- `[x]` 不支持的 model–method 组合返回明确 capability error，而不是 runtime crash 或空结果。（`CapabilityMismatchError.to_record()` 输出 spec §4.4 unsupported 记录）
-- `[ ]` 保留 `experiments/intext_unlearning.py` 为兼容 wrapper，并标记 deprecated；主实验改走 `ulbench.runner`。
+- `[x]` 不支持的 model–method 组合返回明确 capability error，而不是 runtime crash 或空结果。（`CapabilityMismatchError.to_record()` 输出 spec §4.4 unsupported 记录；runner 写 UNSUPPORTED manifest 且不产生空 metric 文件）
+- `[~]` 保留 `experiments/intext_unlearning.py` 为兼容 wrapper，并标记 deprecated；主实验改走 `ulbench.runner`。（新 runner 已可用（`ulbench/tools/pilot_smoke.py` 为入口范例）；legacy 批量管线尚未切换）
 
 **验收标准**：新增一个 no-op method 和一个 prompt method 不需要改 runner；同一 probe suite 可原样用于 prompt、activation 和 weight-update 方法。
 
@@ -674,3 +674,4 @@ class UnlearningMethod:
 | 2026-07-21 | 实现 P0 controls（确定性跨概念 derangement）、MCQ 随机化 + short-answer + alias scorer、eligibility manifest（§9.3 预注册阈值/§9.4 失败码）、核心 metrics（accounting/WCL/FE/matched-retain/bootstrap CI） | `ulbench/probes/`, `ulbench/eligibility.py`, `ulbench/metrics/`, `tests/test_controls.py`, `test_direct_probes.py`, `test_eligibility.py`, `test_metrics.py`（共 84 tests OK） | RQ1 construct-validity 的代码基础就位：visual grounding、MCQ shortcut 与 free-form 可分别观测；refusal/invalid 永不静默计入 forgetting |
 | 2026-07-21 | 真实模型 10-item contract test 工具与首批运行（Qwen3-VL-2B：PASS，generate 与 logit 路径 10/10 一致） | `ulbench/tools/contract_test.py`, `experiments/results/contract_tests/` | ModelAdapter 委托路径在真实 GPU 推理下验证通过，B-P0.3 contract 要求部分落实 |
 | 2026-07-22 | Thinking 评分协议落地：thinking disabled + choice_logprob，绕过 run_logit_thinking，`_apply_chat_template` 关闭空 think 块 + fail loudly，metrics 标注 model_variant_note；GPU 验证 Qwen3-VL-2B-Thinking 由 logit 0/10 恢复到 10/10 | `experiments/intext_unlearning.py`, `ulbench/models/huggingface.py`, `tests/test_thinking_disable.py`, `experiments/results/contract_tests/qwen3vl2b_thinking_disabled.json` | 修复 thinking checkpoint 评分构念错误；旧 Thinking-mode 结果作废，为 breadth study 的 thinking/instruct 对比提供可信基线 |
+| 2026-07-22 | `ulbench.runner` 落地（B-P0.2 收尾）：prompt 渲染器（MCQ 与 legacy 逐字等价）、capability 门控、method hooks、spec §5.2 全套 artifacts、§6.5 result records；adapter 补文本-only 推理路径（P0 controls 必需）；`pilot_smoke` CLI 组合迁移→随机化→controls→短答→runner | `ulbench/runner.py`, `ulbench/probes/render.py`, `ulbench/tools/pilot_smoke.py`, `tests/test_runner.py`（全套 104 tests） | GPU 端到端（Qwen3-VL-2B, 12 概念 ×60 items）：normal=1.00 / shuffled=0.33 / no_image=option_only≈0.17（≤chance）→ 视觉差距 V=0.67；prompt_suppression 零改动插入：MCQ 仍 1.00 而 short_answer 0.83→0.50 —— 行为抑制在 MCQ logit 下完全泄漏，多 probe 设计的必要性首次有了自家数据支撑（RQ1/RQ2 的种子证据） |
