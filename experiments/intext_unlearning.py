@@ -210,7 +210,10 @@ def build_prompt(item, condition, is_forget_split, forget_classes=None):
         )
         lines.append("")
 
-    lines.append("Answer (0-3):")
+    lines.append(
+        "Reply with a single digit 0, 1, 2, or 3 — nothing else.\n"
+        "Answer:"
+    )
     return "\n".join(lines)
 
 
@@ -597,17 +600,51 @@ def load_model_and_processor(model_name, gpu_ids=None):
 
 # ── Inference ──────────────────────────────────────────────────────────
 
+def _has_open_think(text: str) -> bool:
+    """True when *text* ends with an unclosed ``<think>`` reasoning block."""
+    last_open = text.rfind("<think>")
+    if last_open == -1:
+        return False
+    return "</think>" not in text[last_open:]
+
+
 def _apply_chat_template(processor, messages):
-    """Apply chat template, disabling thinking mode if supported."""
+    """Render the chat prompt with thinking disabled for choice_logprob scoring.
+
+    Main experiments score a single answer token at the *end* of the prompt, so
+    the prompt MUST end at the answer position, never inside a reasoning block.
+
+    ``enable_thinking=False`` is not enough: some ``*-Thinking`` checkpoints
+    accept the flag but ignore it — the rendered template still ends with an
+    open ``<think>`` (verified on Qwen3-VL-2B-Thinking, 2026-07-21). We close
+    that empty reasoning block explicitly, then verify no open ``<think>``
+    remains. If thinking cannot actually be disabled we fail loudly rather than
+    silently scoring reasoning-start logits as an answer.
+    """
     try:
-        return processor.apply_chat_template(
+        text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
             enable_thinking=False,
         )
+        flag_supported = True
     except TypeError:
-        return processor.apply_chat_template(
+        text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
+        flag_supported = False
+
+    # Close a forced/empty reasoning block so the answer token comes next.
+    if _has_open_think(text):
+        text = text + "</think>\n\n"
+
+    if _has_open_think(text):
+        raise RuntimeError(
+            "Cannot disable thinking for choice_logprob scoring: the chat "
+            "template still forces an open <think> block after closing "
+            f"(enable_thinking flag supported={flag_supported}). Refusing to "
+            "score reasoning-start logits as an answer."
+        )
+    return text
 
 
 def run_single_inference(model, processor, prompt_text, image_path):
@@ -638,7 +675,13 @@ def run_single_inference(model, processor, prompt_text, image_path):
         )
 
     generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
-    return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    decoded = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    if "<think>" in decoded:
+        raise RuntimeError(
+            "Reasoning output detected despite thinking being disabled; "
+            "refusing to parse an answer from a chain-of-thought trace."
+        )
+    return decoded
 
 
 def run_batch_inference(model, processor, prompt_texts, image_paths):
@@ -726,13 +769,18 @@ def run_batch_inference(model, processor, prompt_texts, image_paths):
 def process_split(model, processor, items, split_name, condition,
                   image_root, max_samples=None, forget_classes=None,
                   batch_size=1, model_tag="",
-                  answer_token_ids=None, is_thinking=False):
+                  answer_token_ids=None, thinking_mode="disabled"):
     """Run inference on *items* under *condition* and return result dicts.
 
-    When *answer_token_ids* is provided, logit-based evaluation is used:
-      - Non-thinking models: batch forward pass, argmax over answer token logits.
-      - Thinking models: per-item generate-128-then-forward strategy.
-    Otherwise falls back to generate+parse (legacy, kept for compatibility).
+    When *answer_token_ids* is provided, choice_logprob scoring is used: a
+    single forward pass, argmax over the answer-token logits. This is the main
+    experiment path for every model, including ``*-Thinking`` checkpoints —
+    they are scored with thinking disabled (see ``_apply_chat_template``).
+
+    Only ``thinking_mode="enabled"`` routes ``*-Thinking`` models through the
+    generate-then-forward path (``run_logit_thinking``); it is retained for
+    future thinking-mode analysis and is never the main-experiment default.
+    Without *answer_token_ids* the legacy generate+parse path is used.
 
     When batch_size > 1, items are processed in batches for higher throughput.
     *model_tag* is a short identifier shown in log lines for multi-GPU runs.
@@ -743,6 +791,10 @@ def process_split(model, processor, items, split_name, condition,
     if use_logit and not processor_has_image_support(processor):
         use_logit = False
         logger.info("Processor has no image support — using model.chat() generate+parse.")
+    # Only explicitly-enabled thinking mode uses the generate-then-forward path;
+    # "disabled" (the main-experiment default) scores every model via the
+    # batched choice_logprob path below.
+    thinking_generate = thinking_mode == "enabled"
     is_forget = "forget" in split_name
     results = []
 
@@ -753,8 +805,8 @@ def process_split(model, processor, items, split_name, condition,
     tag = f"[{model_tag}] " if model_tag else ""
     t_start = time.time()
 
-    if use_logit and is_thinking:
-        # ── Thinking model: per-item generate-then-forward ──────────
+    if use_logit and thinking_generate:
+        # ── Thinking mode (opt-in): per-item generate-then-forward ──
         for idx, item in enumerate(items):
             prompt = build_prompt(item, condition, is_forget, forget_classes)
             abs_path = _resolve_image_path(item, image_root)
@@ -799,8 +851,8 @@ def process_split(model, processor, items, split_name, condition,
                     n_inv, speed, eta,
                 )
 
-    elif use_logit and not is_thinking:
-        # ── Non-thinking model: batched logit forward pass ───────────
+    elif use_logit:
+        # ── choice_logprob: batched logit forward pass (default) ─────
         for batch_start in range(0, total, batch_size):
             batch_items = items[batch_start : batch_start + batch_size]
             prompts, abs_paths, errors_pre = [], [], []
@@ -1056,10 +1108,22 @@ def _invalid_rate(results):
     return round(sum(r["is_invalid"] for r in results) / len(results), 4)
 
 
-def compute_metrics(all_results, forget_classes):
+def _thinking_label(model_name, thinking_mode):
+    """Return the honesty label for a thinking checkpoint, or None."""
+    if not model_name or not is_thinking_model(model_name):
+        return None
+    state = "disabled" if thinking_mode == "disabled" else "enabled"
+    return f"Thinking checkpoint (thinking {state})"
+
+
+def compute_metrics(all_results, forget_classes, model_name=None,
+                    thinking_mode="disabled"):
     """Compute metrics grouped by (split, condition).
 
-    *forget_classes* is a list of class names used for the forget set.
+    *forget_classes* is a list of class names used for the forget set. When
+    *model_name* is a ``*-Thinking`` checkpoint, the metrics carry an explicit
+    ``model_variant_note`` so its numbers are never read as thinking-mode
+    performance.
     """
     groups: dict[tuple, list] = defaultdict(list)
     for r in all_results:
@@ -1070,7 +1134,14 @@ def compute_metrics(all_results, forget_classes):
     metrics: dict = {
         "forget_classes": forget_classes,
         "K": len(forget_classes),
+        "scoring_mode": "choice_logprob",
+        "thinking_mode": thinking_mode,
     }
+    if model_name is not None:
+        metrics["model_name"] = model_name
+    variant_note = _thinking_label(model_name, thinking_mode)
+    if variant_note is not None:
+        metrics["model_variant_note"] = variant_note
 
     for cond in conditions:
         prefix = cond.lower()  # "baseline_normal" or "oracle_hard"
@@ -1211,7 +1282,8 @@ def _print_summary(metrics, model_name, run_conditions):
 
 # ── Incremental save helper ───────────────────────────────────────────
 
-def _save_incremental(out_dir, all_results, forget_classes, condition_name):
+def _save_incremental(out_dir, all_results, forget_classes, condition_name,
+                      model_name=None, thinking_mode="disabled"):
     """Write results.jsonl (full) and metrics.json after each condition."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1220,7 +1292,8 @@ def _save_incremental(out_dir, all_results, forget_classes, condition_name):
     _write_jsonl(out / "results.jsonl", all_results)
 
     # Compute and write metrics on all results so far
-    metrics = compute_metrics(all_results, forget_classes)
+    metrics = compute_metrics(all_results, forget_classes,
+                              model_name=model_name, thinking_mode=thinking_mode)
     with (out / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
@@ -1300,6 +1373,7 @@ def _run_worker_subprocess(args, shard_idx, num_shards, gpu_id, shard_dir):
         "--seed", str(args.seed),
         "--gpu_ids", "0",
         "--batch_size", str(args.batch_size),
+        "--thinking_mode", args.thinking_mode,
         "--out_dir", shard_dir,
         "--_worker",
         "--_shard_idx", str(shard_idx),
@@ -1345,7 +1419,8 @@ def _run_worker_subprocess(args, shard_idx, num_shards, gpu_id, shard_dir):
     return proc, log_file
 
 
-def _reduce_shards(shard_dir, num_shards, out_dir, forget_classes, run_conditions):
+def _reduce_shards(shard_dir, num_shards, out_dir, forget_classes, run_conditions,
+                   model_name=None, thinking_mode="disabled"):
     """Merge per-shard results into final results.jsonl + metrics.json.
 
     Each shard wrote results_shard_{i}.jsonl containing ALL its results
@@ -1368,7 +1443,8 @@ def _reduce_shards(shard_dir, num_shards, out_dir, forget_classes, run_condition
     out.mkdir(parents=True, exist_ok=True)
     _write_jsonl(out / "results.jsonl", all_results)
 
-    metrics = compute_metrics(all_results, forget_classes)
+    metrics = compute_metrics(all_results, forget_classes,
+                              model_name=model_name, thinking_mode=thinking_mode)
     with (out / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
@@ -1450,11 +1526,12 @@ def _run_as_worker(args):
     model, processor = load_model_and_processor(args.model_name, gpu_ids=gpu_ids)
     logger.info("[%s] Model loaded on device=%s", model_tag, model.device)
 
-    # Logit-based eval setup
+    # choice_logprob eval setup
     thinking = is_thinking_model(args.model_name)
     answer_tids = get_answer_token_ids(processor)
-    logger.info("[%s] Logit eval: is_thinking=%s  answer_token_ids=%s",
-                model_tag, thinking, answer_tids)
+    logger.info("[%s] choice_logprob eval: thinking_checkpoint=%s  "
+                "thinking_mode=%s  answer_token_ids=%s",
+                model_tag, thinking, args.thinking_mode, answer_tids)
 
     all_results: list[dict] = []
 
@@ -1465,7 +1542,7 @@ def _run_as_worker(args):
         batch_size=batch_size,
         model_tag=model_tag,
         answer_token_ids=answer_tids,
-        is_thinking=thinking,
+        thinking_mode=args.thinking_mode,
     )
 
     # ── BASELINE_NORMAL ────────────────────────────────────────────
@@ -1616,6 +1693,13 @@ def main():
         help="Batch size for inference (default: 8).",
     )
     parser.add_argument(
+        "--thinking_mode", choices=["disabled", "enabled"], default="disabled",
+        help="Main experiments MUST keep 'disabled': *-Thinking checkpoints are "
+             "scored with thinking off via choice_logprob, and results are "
+             "labeled 'Thinking checkpoint (thinking disabled)'. 'enabled' is an "
+             "opt-in for future thinking-mode analysis only.",
+    )
+    parser.add_argument(
         "--num_workers", type=int, default=1,
         help="Number of data-parallel workers. Each worker loads the model "
              "on a separate GPU and processes 1/N of the data. "
@@ -1722,6 +1806,7 @@ def _run_mapreduce(args):
     # ── REDUCE: merge shard results ────────────────────────────────
     metrics = _reduce_shards(
         shard_base, num_workers, args.out_dir, forget_classes, run_conditions,
+        model_name=args.model_name, thinking_mode=args.thinking_mode,
     )
 
     _print_summary(metrics, args.model_name, run_conditions)
@@ -1797,8 +1882,9 @@ def _run_single_process(args):
     # Logit-based eval setup
     thinking = is_thinking_model(args.model_name)
     answer_tids = get_answer_token_ids(processor)
-    logger.info("[%s] Logit eval: is_thinking=%s  answer_token_ids=%s",
-                model_tag, thinking, answer_tids)
+    logger.info("[%s] choice_logprob eval: thinking_checkpoint=%s  "
+                "thinking_mode=%s  answer_token_ids=%s",
+                model_tag, thinking, args.thinking_mode, answer_tids)
 
     all_results: list[dict] = []
 
@@ -1816,7 +1902,7 @@ def _run_single_process(args):
         batch_size=batch_size,
         model_tag=model_tag,
         answer_token_ids=answer_tids,
-        is_thinking=thinking,
+        thinking_mode=args.thinking_mode,
     )
 
     # ── BASELINE_NORMAL (always) ───────────────────────────────────
@@ -1833,7 +1919,8 @@ def _run_single_process(args):
     logger.info("[%s] ═══ BASELINE_NORMAL done (%.0fs) — saving ═══",
                 model_tag, time.time() - cond_t0)
     metrics = _save_incremental(
-        args.out_dir, all_results, forget_classes, "BASELINE_NORMAL")
+        args.out_dir, all_results, forget_classes, "BASELINE_NORMAL",
+        model_name=args.model_name, thinking_mode=args.thinking_mode)
 
     # ── Helper: run extra condition ────────────────────────────────
     def _run_condition(cond):
@@ -1856,7 +1943,8 @@ def _run_single_process(args):
         logger.info("[%s] ═══ %s done (%.0fs) — saving ═══",
                     model_tag, cond, time.time() - cond_t0)
         return _save_incremental(
-            args.out_dir, all_results, forget_classes, cond)
+            args.out_dir, all_results, forget_classes, cond,
+            model_name=args.model_name, thinking_mode=args.thinking_mode)
 
     for cond in extra_conditions:
         metrics = _run_condition(cond)
@@ -1876,7 +1964,8 @@ def _run_single_process(args):
                 model, processor, train_forget, "train_forget", cond, **_kw,
             ))
         _save_incremental(
-            args.out_dir, all_results, forget_classes, "train_forget")
+            args.out_dir, all_results, forget_classes, "train_forget",
+            model_name=args.model_name, thinking_mode=args.thinking_mode)
 
     if args.train_retain_jsonl:
         train_retain = _load_jsonl(args.train_retain_jsonl)
@@ -1899,7 +1988,8 @@ def _run_single_process(args):
                     copy["condition"] = cond
                     all_results.append(copy)
         metrics = _save_incremental(
-            args.out_dir, all_results, forget_classes, "train_retain")
+            args.out_dir, all_results, forget_classes, "train_retain",
+            model_name=args.model_name, thinking_mode=args.thinking_mode)
 
     # ── Final summary ──────────────────────────────────────────────
     run_conditions = ["BASELINE_NORMAL"] + extra_conditions
