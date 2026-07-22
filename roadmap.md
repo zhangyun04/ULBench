@@ -320,22 +320,22 @@ class UnlearningMethod:
     def metadata(self) -> dict: ...
 ```
 
-- `[ ]` 把 `build_prompt()` 中 `UNLEARN_SOFT/MEDIUM` 迁到 `ulbench/methods/prompt_suppression.py`。
-- `[ ]` 把 `ORACLE_HARD/REVERSE` 迁到 `ulbench/audits/oracle_controls.py`，不再列入 unlearning methods 主表。
+- `[x]` 把 `build_prompt()` 中 `UNLEARN_SOFT/MEDIUM` 迁到 `ulbench/methods/prompt_suppression.py`。（legacy 保留原实现直至 runner 落地；`tests/test_methods.py` 强制两侧 prompt 逐字一致）
+- `[x]` 把 `ORACLE_HARD/REVERSE` 迁到 `ulbench/audits/oracle_controls.py`，不再列入 unlearning methods 主表。（不继承 `UnlearningMethod`，类型层面无法注册为 method）
 - `[ ]` runner 只接受 `model_adapter + method_adapter + probe_suite + metric_suite`。
-- `[ ]` method 声明需要的能力：I/O、logits、hidden states、gradients、weight write、retain set。
-- `[ ]` 不支持的 model–method 组合返回明确 capability error，而不是 runtime crash 或空结果。
+- `[x]` method 声明需要的能力：I/O、logits、hidden states、gradients、weight write、retain set。（`MethodSpec.required_capabilities` + `UnlearningMethod.validate_against`）
+- `[x]` 不支持的 model–method 组合返回明确 capability error，而不是 runtime crash 或空结果。（`CapabilityMismatchError.to_record()` 输出 spec §4.4 unsupported 记录）
 - `[ ]` 保留 `experiments/intext_unlearning.py` 为兼容 wrapper，并标记 deprecated；主实验改走 `ulbench.runner`。
 
 **验收标准**：新增一个 no-op method 和一个 prompt method 不需要改 runner；同一 probe suite 可原样用于 prompt、activation 和 weight-update 方法。
 
 ## B-P0.3 抽离 model adapter
 
-- `[ ]` 从 `load_model_and_processor()`、`run_logit_batch()`、`run_internvl_batch()` 抽出统一 `ModelAdapter`。
-- `[ ]` 支持以下能力查询：`supports_images`、`supports_logits`、`supports_hidden_states`、`supports_gradients`、`supports_system_prompt`、`is_closed_api`。
-- `[ ]` 分离 instruct/thinking 模型逻辑；保存最终答案与 reasoning trace 的可见部分，但默认不把 chain-of-thought 当作可公开数据。
+- `[x]` 从 `load_model_and_processor()`、`run_logit_batch()`、`run_internvl_batch()` 抽出统一 `ModelAdapter`。（`ulbench/models/`：HF/InternVL 适配器暂委托 legacy 实现，runner 落地后翻转依赖方向）
+- `[x]` 支持以下能力查询：`supports_images`、`supports_logits`、`supports_hidden_states`、`supports_gradients`、`supports_system_prompt`、`is_closed_api`。
+- `[~]` 分离 instruct/thinking 模型逻辑；保存最终答案与 reasoning trace 的可见部分，但默认不把 chain-of-thought 当作可公开数据。（`is_thinking` 路由 + 独立 scoring 路径已有；reasoning trace 保存策略未实现）
 - `[ ]` 把 `scripts/model_list.txt` 迁移为 `configs/models/*.yaml`，冻结 model revision、chat template 和 loader type。
-- `[ ]` 给每个模型跑 10-item contract test：同一输入字段、相同输出 schema、无 silent fallback。
+- `[~]` 给每个模型跑 10-item contract test：同一输入字段、相同输出 schema、无 silent fallback。（`ulbench/tools/contract_test.py`；已通过：Qwen3-VL-2B-Instruct（generate 与 logit 两路径 10/10 一致）、InternVL3-1B（model.chat 路径，需 einops/timm——已装并固定进 requirements.txt）、Qwen3-VL-2B-Thinking（thinking disabled + choice_logprob：logit 10/10 GT、两路径一致 10/10；旧 thinking-logit 路径 0/10 已弃用，见 §8 决策）；其余 model_list 模型待跑）
 
 **验收标准**：模型特殊分支不再散落在 evaluator 中；失败样本带明确 error taxonomy，invalid 不再自动等价于成功遗忘。
 
@@ -343,16 +343,16 @@ class UnlearningMethod:
 
 ### P0 Visual-grounding controls
 
-- `[ ]` `normal_image`：原图。
-- `[ ]` `no_image`：去掉视觉输入，保留问题与选项。
-- `[ ]` `shuffled_image`：同 batch 随机错配图片。
-- `[ ]` `option_only`：只给选项，检查答案位置/语义先验。
-- `[ ]` `question_only`：不给选项，检查语言先验。
+- `[x]` `normal_image`：原图。
+- `[x]` `no_image`：去掉视觉输入，保留问题与选项。
+- `[x]` `shuffled_image`：同 batch 随机错配图片。（注册的确定性跨概念 derangement，记录 donor 与 seed；不可行时 fail loudly）
+- `[x]` `option_only`：只给选项，检查答案位置/语义先验。
+- `[~]` `question_only`：不给选项，检查语言先验。（对非 MCQ 已支持；MCQ 无定义，属 audit 条件非 v1 gate）
 
 ### P1 Direct probes
 
-- `[ ]` MCQ：每个 item 多次随机选项顺序；答案位置严格均衡。
-- `[ ]` Short answer：接受 canonical name + aliases；记录 exact/normalized/semantic 三种评分。
+- `[x]` MCQ：每个 item 多次随机选项顺序；答案位置严格均衡。（balancing block 内按构造均衡，permutation + seed 存 per-item metadata）
+- `[~]` Short answer：接受 canonical name + aliases；记录 exact/normalized/semantic 三种评分。（exact/normalized 已实现并分开记录；semantic 按冻结决策待人工一致性验证）
 - `[ ]` Image-text matching：判断图像是否对应目标概念，避免生成格式问题。
 
 ### P2 Indirect probes
@@ -376,12 +376,13 @@ class UnlearningMethod:
 ## B-P0.5 Model-specific concept eligibility
 
 - `[ ]` 在任何 unlearning 前，对每个 `model × concept × probe` 跑 `M0` baseline。
-- `[ ]` 预注册 eligibility 规则：
+- `[x]` 预注册 eligibility 规则：
   - `Acc_image ≥ τ_acc`；
   - `Acc_image − max(Acc_no_image, Acc_option_only, Acc_shuffled) ≥ τ_visual`；
   - bootstrap lower bound 或最小样本量达到要求；
   - 多 prompt/order variants 稳定性达到要求。
-- `[ ]` 生成 `eligible_concepts/<model_revision>.json`，记录通过/失败原因。
+  （`EligibilityThresholds`，spec §9.3 pilot candidate 值；修改需走 Decision Log）
+- `[x]` 生成 `eligible_concepts/<model_revision>.json`，记录通过/失败原因。（构建/写出/coverage 代码与测试就绪，待 M0 数据）
 - `[ ]` 主指标只在 eligible concepts 上汇总；附录同时给所有候选概念，防止 cherry-picking。
 - `[ ]` 报告每个模型的 coverage：通过概念数/候选概念数。不能只报 eligible 子集上的高分。
 - `[ ]` 概念选择阈值在 full run 前冻结，并做阈值敏感性分析。
@@ -392,10 +393,10 @@ class UnlearningMethod:
 
 核心不使用单一总分，至少报告以下维度：
 
-- `[ ]` **Knowledge Access**：每个 probe 的原始正确率/匹配分数。
-- `[ ]` **Worst-Case Leakage (WCL)**：固定攻击预算内，跨 direct/indirect/adversarial probes 的最大可恢复访问率。
-- `[ ]` **Forgetting Effect**：相对 `M0` 的 paired access reduction；明确 chance floor 和 invalid/refusal 处理。
-- `[ ]` **Matched Retain Fidelity**：干预前后 matched retain item 的正确性与输出一致性。
+- `[x]` **Knowledge Access**：每个 probe 的原始正确率/匹配分数。（`metrics/accounting.py`：access_rate 与 conditional_accuracy 双视角 + coverage）
+- `[x]` **Worst-Case Leakage (WCL)**：固定攻击预算内，跨 direct/indirect/adversarial probes 的最大可恢复访问率。（`metrics/leakage.py`，含 null/contained 分解与 budget 披露）
+- `[x]` **Forgetting Effect**：相对 `M0` 的 paired access reduction；明确 chance floor 和 invalid/refusal 处理。（`metrics/forgetting.py`：FE_access/FE_clean + 状态 delta 分解，不配对即报错）
+- `[x]` **Matched Retain Fidelity**：干预前后 matched retain item 的正确性与输出一致性。（kept/lost/gained 转移 + 输出一致率）
 - `[ ]` **Neighborhood Damage**：相邻类、同 superclass、同 attribute 与远距离 retain 分层报告。
 - `[ ]` **General Utility Retention**：至少覆盖知识、推理、感知三个维度，而不是只用单一 MMMU。
 - `[ ]` **Refusal/Invalid Rate**：单独报告，不能把无效输出直接当作忘记成功。
@@ -642,6 +643,7 @@ class UnlearningMethod:
 | General utility suite | MMMU + MMStar + 1 个 perception benchmark | M2 | `[ ]` |
 | Open-answer scorer | normalization + alias + semantic judge + 人工抽查 | M2 | `[ ]` |
 | 是否保留 ImageNet | 补齐 config 和 release 流程，否则从当前支持清单删除 | M1 | `[ ]` |
+| Thinking 模型评分协议 | 已决策（2026-07-22）：主实验固定 thinking disabled + choice_logprob。`enable_thinking=False` 对 *-Thinking 无效（模板仍 `<think>\n`），故 `_apply_chat_template` 关闭空 think 块并 fail loudly；`process_split` 绕过 `run_logit_thinking`。GPU 验证 Qwen3-VL-2B-Thinking：0/10 → 10/10。结果标 "Thinking checkpoint (thinking disabled)"，旧 Thinking 结果作废 | 已完成 | `[x]` |
 
 ---
 
@@ -650,11 +652,11 @@ class UnlearningMethod:
 1. `[x]` 写 `benchmark_spec_v1.md`：任务、权限、probe、metrics、claim boundary。
 2. `[x]` 修正 `split_registry.yaml` 命名/`k` 不一致及 README/ImageNet 不一致。
 3. `[x]` 新建 `ulbench/schema.py` 与旧 JSONL validator/migration。
-4. `[ ]` 抽离 `ModelAdapter` 和 `UnlearningMethod`；迁移现有 prompt conditions。
-5. `[ ]` 实现 no-image、shuffled-image、option-only controls。
-6. `[ ]` 实现 MCQ option randomization + short-answer probe + alias scorer。
-7. `[ ]` 实现 eligibility manifest 与 coverage reporting。
-8. `[ ]` 拆出新 metrics：WCL、matched retain、refusal、cost、bootstrap CI。
+4. `[x]` 抽离 `ModelAdapter` 和 `UnlearningMethod`；迁移现有 prompt conditions。
+5. `[x]` 实现 no-image、shuffled-image、option-only controls。（`ulbench/probes/controls.py`：跨概念确定性 derangement，pairing 级校验）
+6. `[x]` 实现 MCQ option randomization + short-answer probe + alias scorer。（`ulbench/probes/direct.py`、`scorers.py`；semantic scorer 按冻结决策留待 G0 人工一致性验证后）
+7. `[x]` 实现 eligibility manifest 与 coverage reporting。（`ulbench/eligibility.py`：spec §9.3 预注册阈值 + §9.4 manifest/失败码；等 M0 GPU baseline 后产出真实 manifest）
+8. `[~]` 拆出新 metrics：WCL、matched retain、refusal、cost、bootstrap CI。（`ulbench/metrics/`：accounting/WCL/FE/matched-retain/bootstrap 已完成；cost 聚合与 per-item 落盘随 runner 实现）
 9. `[ ]` 在 2 个模型上跑 construct-validity pilot，并召开一次 G0 决策。
 10. `[ ]` Pilot 通过后再接 R1/R2 方法和启动 full study；同时按新故事改 Abstract/Introduction。
 
@@ -668,3 +670,7 @@ class UnlearningMethod:
 | 2026-07-20 | 冻结 benchmark specification v1 normative draft | `docs/benchmark_spec_v1.md` | 明确 benchmark/method/evaluation 边界，并冻结 eligibility、probe、result status 与 metric contracts |
 | 2026-07-20 | 修复 split registry 和 ImageNet 文档/配置漂移 | `scripts/split_registry.yaml`, `vqa_gen/configs/imagenet_identity_mvp.yaml`, `tests/test_repository_consistency.py` | 防止 split 规模误报，并将 ImageNet 支持限定为可验证的显式配置 |
 | 2026-07-20 | 新建 v1 schema、跨记录 validator 与 legacy migration CLI | `ulbench/schema.py`, `ulbench/validation.py`, `ulbench/tools/`, `tests/` | 将 eligibility、method capability、manifest 和 invalid/refusal 边界变成可执行合同；legacy 数据不能静默进入 v1 |
+| 2026-07-21 | 抽离 `UnlearningMethod`/`ModelAdapter` 插件接口；UNLEARN_SOFT/MEDIUM → R0 method、ORACLE_HARD/REVERSE → audit control；capability mismatch → spec §4.4 unsupported 记录 | `ulbench/types.py`, `ulbench/methods/`, `ulbench/audits/`, `ulbench/models/`, `tests/test_methods.py`, `tests/test_model_adapter.py` | prompt suppression 正式成为可插拔 R0 baseline 而非 benchmark 本身；oracle 在类型层面被排除出 method 排名，直接支撑 method-agnostic claim |
+| 2026-07-21 | 实现 P0 controls（确定性跨概念 derangement）、MCQ 随机化 + short-answer + alias scorer、eligibility manifest（§9.3 预注册阈值/§9.4 失败码）、核心 metrics（accounting/WCL/FE/matched-retain/bootstrap CI） | `ulbench/probes/`, `ulbench/eligibility.py`, `ulbench/metrics/`, `tests/test_controls.py`, `test_direct_probes.py`, `test_eligibility.py`, `test_metrics.py`（共 84 tests OK） | RQ1 construct-validity 的代码基础就位：visual grounding、MCQ shortcut 与 free-form 可分别观测；refusal/invalid 永不静默计入 forgetting |
+| 2026-07-21 | 真实模型 10-item contract test 工具与首批运行（Qwen3-VL-2B：PASS，generate 与 logit 路径 10/10 一致） | `ulbench/tools/contract_test.py`, `experiments/results/contract_tests/` | ModelAdapter 委托路径在真实 GPU 推理下验证通过，B-P0.3 contract 要求部分落实 |
+| 2026-07-22 | Thinking 评分协议落地：thinking disabled + choice_logprob，绕过 run_logit_thinking，`_apply_chat_template` 关闭空 think 块 + fail loudly，metrics 标注 model_variant_note；GPU 验证 Qwen3-VL-2B-Thinking 由 logit 0/10 恢复到 10/10 | `experiments/intext_unlearning.py`, `ulbench/models/huggingface.py`, `tests/test_thinking_disable.py`, `experiments/results/contract_tests/qwen3vl2b_thinking_disabled.json` | 修复 thinking checkpoint 评分构念错误；旧 Thinking-mode 结果作废，为 breadth study 的 thinking/instruct 对比提供可信基线 |
