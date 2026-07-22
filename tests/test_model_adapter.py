@@ -158,6 +158,41 @@ class ConcreteAdapterDeclarationTest(unittest.TestCase):
         )
         self.assertEqual(adapter.thinking_mode, "enabled")
 
+    def test_generate_partitions_imaged_and_text_only(self):
+        from unittest import mock
+
+        from ulbench.models.huggingface import HuggingFaceAdapter
+
+        adapter = HuggingFaceAdapter("fake/model")
+        adapter.model = object()      # pretend loaded
+        adapter.processor = object()
+
+        requests = [
+            ProbeRequest(request_id="r0", item_id="i0", question="q",
+                         choices=None, image_path="a.jpg", prompt_text="p0"),
+            ProbeRequest(request_id="r1", item_id="i1", question="q",
+                         choices=None, image_path=None, prompt_text="p1"),
+            ProbeRequest(request_id="r2", item_id="i2", question="q",
+                         choices=None, image_path="b.jpg", prompt_text="p2"),
+        ]
+
+        fake_legacy = mock.Mock()
+        fake_legacy.run_batch_inference.return_value = ["img0", "img2"]
+        with mock.patch("ulbench.models.huggingface._legacy",
+                        return_value=fake_legacy), \
+             mock.patch.object(adapter, "_generate_text_only",
+                               return_value=["txt1"]) as text_only:
+            responses = adapter.generate(requests)
+
+        # Order preserved; each request routed to the right path.
+        self.assertEqual([r.raw_output for r in responses],
+                         ["img0", "txt1", "img2"])
+        fake_legacy.run_batch_inference.assert_called_once()
+        self.assertEqual(
+            fake_legacy.run_batch_inference.call_args.args[2], ["p0", "p2"]
+        )
+        text_only.assert_called_once_with(["p1"])
+
 
 if __name__ == "__main__":
     unittest.main()

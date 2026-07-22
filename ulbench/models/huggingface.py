@@ -11,12 +11,16 @@ pulls in torch.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Optional
 
 from ulbench.schema import ModelCapabilities, ResponseStatus
 from ulbench.types import ProbeRequest, ProbeResponse
 from ulbench.models.base import ModelAdapter
+
+
+logger = logging.getLogger(__name__)
 
 
 def _legacy():
@@ -106,14 +110,82 @@ class HuggingFaceAdapter(ModelAdapter):
                 ))
         return responses
 
+    # ── text-only inference (P0 no_image / option_only controls) ─────
+    # The legacy inference paths require an image; control conditions
+    # deliberately omit it, so the adapter owns the text-only branch.
+
+    def _text_only_batch(self, prompts: list[str]):
+        """Return (inputs, device) for a text-only prompt batch."""
+        import torch  # local: keep ulbench import light
+
+        legacy = _legacy()
+        texts = []
+        for prompt in prompts:
+            messages = [{"role": "user",
+                         "content": [{"type": "text", "text": prompt}]}]
+            texts.append(legacy._apply_chat_template(self.processor, messages))
+        inputs = self.processor(text=texts, return_tensors="pt", padding=True)
+        device = legacy._get_first_device(self.model)
+        return inputs.to(device), torch
+
+    def _generate_text_only(self, prompts: list[str]) -> list[str]:
+        try:
+            inputs, torch = self._text_only_batch(prompts)
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs, max_new_tokens=64, do_sample=False,
+                )
+            generated = output_ids[:, inputs.input_ids.shape[1]:]
+            return self.processor.batch_decode(
+                generated, skip_special_tokens=True,
+            )
+        except Exception as exc:
+            logger.warning("Text-only generate failed: %s", exc)
+            return [""] * len(prompts)
+
+    def _score_text_only(self, prompts: list[str]) -> list[Optional[int]]:
+        legacy = _legacy()
+        try:
+            inputs, torch = self._text_only_batch(prompts)
+            with torch.no_grad():
+                out = self.model(**inputs)
+            last_logits = out.logits[:, -1, :]
+            return [legacy._logit_pick(last_logits[index],
+                                       self._answer_token_ids)
+                    for index in range(len(prompts))]
+        except Exception as exc:
+            logger.warning("Text-only logit scoring failed: %s", exc)
+            return [None] * len(prompts)
+
+    @staticmethod
+    def _partition_by_image(requests: list[ProbeRequest]):
+        with_image, text_only = [], []
+        for index, request in enumerate(requests):
+            (with_image if request.image_path else text_only).append(index)
+        return with_image, text_only
+
     def generate(self, requests: list[ProbeRequest]) -> list[ProbeResponse]:
         self.load()
         prompts = [request.prompt_text or "" for request in requests]
-        images = [request.image_path for request in requests]
         start = time.time()
-        raw_outputs = _legacy().run_batch_inference(
-            self.model, self.processor, prompts, images
-        )
+
+        with_image, text_only = self._partition_by_image(requests)
+        raw_outputs: list[str] = [""] * len(requests)
+        if with_image:
+            outputs = _legacy().run_batch_inference(
+                self.model, self.processor,
+                [prompts[index] for index in with_image],
+                [requests[index].image_path for index in with_image],
+            )
+            for index, output in zip(with_image, outputs):
+                raw_outputs[index] = output
+        if text_only:
+            outputs = self._generate_text_only(
+                [prompts[index] for index in text_only]
+            )
+            for index, output in zip(text_only, outputs):
+                raw_outputs[index] = output
+
         latency_ms = (time.time() - start) * 1000.0 / max(len(requests), 1)
         return self._responses_from_raw(requests, raw_outputs, latency_ms)
 
@@ -126,26 +198,39 @@ class HuggingFaceAdapter(ModelAdapter):
             self._answer_token_ids = legacy.get_answer_token_ids(self.processor)
 
         prompts = [request.prompt_text or "" for request in requests]
-        images = [request.image_path for request in requests]
         start = time.time()
+
+        with_image, text_only = self._partition_by_image(requests)
+        picks: list[Optional[int]] = [None] * len(requests)
         if self.thinking_mode == "enabled":
             # Opt-in thinking-mode analysis: generate reasoning, then score.
-            picks: list[Optional[int]] = []
-            for prompt, image in zip(prompts, images):
+            # Only defined for imaged requests; text-only stays unsupported.
+            for index in with_image:
                 try:
-                    picks.append(legacy.run_logit_thinking(
-                        self.model, self.processor, prompt, image,
-                        self._answer_token_ids,
-                    ))
+                    picks[index] = legacy.run_logit_thinking(
+                        self.model, self.processor, prompts[index],
+                        requests[index].image_path, self._answer_token_ids,
+                    )
                 except Exception:
-                    picks.append(None)
+                    picks[index] = None
         else:
             # Default: choice_logprob with thinking disabled at the template
             # level (legacy._apply_chat_template), for every checkpoint.
-            picks = legacy.run_logit_batch(
-                self.model, self.processor, prompts, images,
-                self._answer_token_ids,
-            )
+            if with_image:
+                imaged_picks = legacy.run_logit_batch(
+                    self.model, self.processor,
+                    [prompts[index] for index in with_image],
+                    [requests[index].image_path for index in with_image],
+                    self._answer_token_ids,
+                )
+                for index, pick in zip(with_image, imaged_picks):
+                    picks[index] = pick
+            if text_only:
+                text_picks = self._score_text_only(
+                    [prompts[index] for index in text_only]
+                )
+                for index, pick in zip(text_only, text_picks):
+                    picks[index] = pick
         latency_ms = (time.time() - start) * 1000.0 / max(len(requests), 1)
 
         responses = []
