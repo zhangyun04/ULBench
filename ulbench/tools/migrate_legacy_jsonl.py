@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ulbench.ids import option_order_hash as _option_order_hash
+from ulbench.ids import slug as _slug
+from ulbench.ids import stable_id as _stable_id
 from ulbench.schema import (
     SCHEMA_VERSION,
     BenchmarkItem,
@@ -34,16 +36,6 @@ class MigrationContext:
     provenance_note: str
     probe_id: str = "legacy.mcq.identity.v1"
     prompt_variant_id: str = "legacy_default"
-
-
-def _slug(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
-    return normalized or hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-
-
-def _stable_id(prefix: str, *parts: Any) -> str:
-    encoded = json.dumps(parts, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return f"{prefix}:{hashlib.sha256(encoded).hexdigest()[:20]}"
 
 
 def _migrate_record(
@@ -99,9 +91,7 @@ def _migrate_record(
         raise SchemaValidationError("legacy record", ["image must be non-empty"])
     image_id = _stable_id("image", context.dataset_id, image)
     concept_id = f"{context.dataset_id}:{_slug(concept_name)}"
-    option_order_hash = hashlib.sha256(
-        json.dumps(choices, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()[:12]
+    option_order_hash = _option_order_hash(choices)
     pairing_id = _stable_id(
         "pair",
         sample_id,
